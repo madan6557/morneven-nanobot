@@ -23,7 +23,8 @@ from starlette.middleware import Middleware
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
 from nanobot.config.loader import (
@@ -35,7 +36,8 @@ from nanobot.config.schema import Config
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 SECRET_FIELDS = {"api_key", "apiKey", "token", "app_secret", "appSecret", "encrypt_key", "encryptKey", "verification_token", "verificationToken"}
 
-templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+BASE_DIR = Path(__file__).parent
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -649,6 +651,7 @@ async def ensure_gateway_started():
 
 
 routes = [
+    Mount("/assets", StaticFiles(directory=str(BASE_DIR / "img")), name="assets"),
     Route("/", homepage),
     Route("/health", health),
     Route("/api/config", api_config_get, methods=["GET"]),

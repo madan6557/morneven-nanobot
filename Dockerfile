@@ -7,10 +7,11 @@ RUN apt-get update && \
 COPY requirements.txt /app/requirements.txt
 RUN uv pip install --system --no-cache nanobot-ai -r /app/requirements.txt
 
-RUN mkdir -p /data/.nanobot
+RUN mkdir -p /data/.nanobot /app/img
 
 COPY server.py /app/server.py
 COPY templates/ /app/templates/
+COPY img/logo-white.png /app/img/logo-white.png
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
