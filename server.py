@@ -292,6 +292,7 @@ def apply_bundle_to_config(bundle):
     data = config.model_dump(by_alias=True)
 
     credentials = bundle.get("credentials") if isinstance(bundle, dict) else None
+    credential_models = {}
     if isinstance(credentials, dict):
         providers = data.setdefault("providers", {})
         for provider, credential in credentials.items():
@@ -300,10 +301,13 @@ def apply_bundle_to_config(bundle):
             provider_config = providers.setdefault(provider, {})
             api_key = credential.get("apiKey") or credential.get("api_key")
             api_base = credential.get("apiBase") or credential.get("api_base")
+            model_id = credential.get("modelId") or credential.get("model_id")
             if api_key:
                 provider_config["apiKey"] = api_key
             if api_base is not None:
                 provider_config["apiBase"] = api_base
+            if api_key and model_id:
+                credential_models[provider] = model_id
 
     channels = bundle.get("channels") if isinstance(bundle, dict) else None
     if isinstance(channels, dict):
@@ -329,6 +333,13 @@ def apply_bundle_to_config(bundle):
     agents = data.setdefault("agents", {})
     defaults = agents.setdefault("defaults", {})
     defaults["workspace"] = str(WORKSPACE_PATH)
+    preferred_provider = defaults.get("provider")
+    if preferred_provider in credential_models:
+        defaults["model"] = credential_models[preferred_provider]
+    elif preferred_provider in {None, "", "auto"} and len(credential_models) == 1:
+        provider, model_id = next(iter(credential_models.items()))
+        defaults["provider"] = provider
+        defaults["model"] = model_id
 
     save_config(Config.model_validate(data))
 
