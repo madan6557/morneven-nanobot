@@ -43,7 +43,6 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 MORNEVEN_BACKEND_INTERNAL_URL = os.environ.get("MORNEVEN_BACKEND_INTERNAL_URL", "").strip()
-MORNEVEN_BACKEND_INTERNAL_PORT = os.environ.get("MORNEVEN_BACKEND_INTERNAL_PORT", "3000").strip()
 MORNEVEN_BACKEND_PUBLIC_URL = os.environ.get("MORNEVEN_BACKEND_PUBLIC_URL", "").strip()
 MORNEVEN_BOT_MANAGER_SYNC_TOKEN = os.environ.get("MORNEVEN_BOT_MANAGER_SYNC_TOKEN", "").strip()
 NANOBOT_MORNEVEN_RELOAD_TOKEN = os.environ.get("NANOBOT_MORNEVEN_RELOAD_TOKEN", "").strip()
@@ -240,7 +239,7 @@ def normalize_service_url(raw, default_port=""):
 def backend_base_urls():
     urls = []
     for raw, default_port in (
-        (MORNEVEN_BACKEND_INTERNAL_URL, MORNEVEN_BACKEND_INTERNAL_PORT),
+        (MORNEVEN_BACKEND_INTERNAL_URL, "8080"),
         (MORNEVEN_BACKEND_PUBLIC_URL, ""),
     ):
         clean = normalize_service_url(raw, default_port)
