@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import signal
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -691,6 +692,41 @@ app = Starlette(
 )
 
 
+def create_server_socket(host, port):
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    server_socket = socket.socket(family, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if family == socket.AF_INET6 and hasattr(socket, "IPV6_V6ONLY"):
+        server_socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    server_socket.bind((host, port))
+    server_socket.listen(2048)
+    server_socket.set_inheritable(True)
+    return server_socket
+
+
+def create_server_sockets(port):
+    configured = os.environ.get("HOSTS") or os.environ.get("HOST") or "0.0.0.0,::"
+    hosts = []
+    for host in configured.split(","):
+        clean = host.strip()
+        if clean and clean not in hosts:
+            hosts.append(clean)
+
+    sockets = []
+    errors = []
+    for host in hosts:
+        try:
+            sockets.append(create_server_socket(host, port))
+        except OSError as exc:
+            errors.append(f"{host}: {exc}")
+
+    if not sockets:
+        raise RuntimeError(f"Unable to bind any server socket on port {port}: {'; '.join(errors)}")
+    if errors:
+        print(f"Socket bind warnings: {'; '.join(errors)}")
+    return sockets
+
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -699,8 +735,8 @@ if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    host = os.environ.get("HOST", "::")
-    config = uvicorn.Config(app, host=host, port=port, log_level="info", loop="asyncio")
+    sockets = create_server_sockets(port)
+    config = uvicorn.Config(app, log_level="info", loop="asyncio")
     server = uvicorn.Server(config)
 
     def handle_signal():
@@ -710,4 +746,4 @@ if __name__ == "__main__":
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, handle_signal)
 
-    loop.run_until_complete(server.serve())
+    loop.run_until_complete(server.serve(sockets=sockets))
