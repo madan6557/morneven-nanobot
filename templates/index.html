@@ -669,6 +669,9 @@
   </main>
 
   <script>
+    const STATUS_POLL_MS = 60000;
+    const LOGS_POLL_MS = 5000;
+
     function app() {
       return {
         tab: 'overview',
@@ -681,6 +684,8 @@
         restartAfterSave: true,
         toast: { show: false, message: '', type: 'success' },
         customModels: {},
+        statusPollId: null,
+        logsPollId: null,
 
         providerList: [
           // Requested order: Gemini, Anthropic, Groq, OpenAI, then the rest.
@@ -927,12 +932,49 @@
           }
         },
 
+        isPageVisible() {
+          return document.visibilityState === 'visible';
+        },
+
+        clearPolling() {
+          if (this.statusPollId) {
+            clearInterval(this.statusPollId);
+            this.statusPollId = null;
+          }
+          if (this.logsPollId) {
+            clearInterval(this.logsPollId);
+            this.logsPollId = null;
+          }
+        },
+
+        updatePolling() {
+          this.clearPolling();
+          if (!this.isPageVisible()) return;
+
+          this.statusPollId = setInterval(() => this.loadStatus(), STATUS_POLL_MS);
+          if (this.tab === 'logs') {
+            this.logsPollId = setInterval(() => this.loadLogs(), LOGS_POLL_MS);
+          }
+        },
+
+        async refreshVisibleData() {
+          if (!this.isPageVisible()) return;
+          await this.loadStatus();
+          if (this.tab === 'logs') await this.loadLogs();
+        },
+
         async init() {
           await this.loadConfig();
-          await this.loadStatus();
-          await this.loadLogs();
-          setInterval(() => this.loadStatus(), 5000);
-          setInterval(() => this.loadLogs(), 3000);
+          await this.refreshVisibleData();
+          this.updatePolling();
+          document.addEventListener('visibilitychange', () => {
+            this.updatePolling();
+            void this.refreshVisibleData();
+          });
+          this.$watch('tab', () => {
+            this.updatePolling();
+            void this.refreshVisibleData();
+          });
         },
 
         async loadConfig() {
@@ -959,6 +1001,7 @@
             if (res.ok) {
               this.showToast('Configuration saved successfully', 'success');
               await this.loadConfig();
+              await this.loadStatus();
             } else {
               this.showToast('Failed to save configuration', 'error');
             }
