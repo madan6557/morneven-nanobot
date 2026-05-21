@@ -122,11 +122,11 @@
     <!-- Footer Actions -->
     <div class="p-4 border-t border-gray-800 space-y-3 bg-black">
       <div class="grid grid-cols-2 gap-2">
-        <button @click="startGateway()" :disabled="status.gateway?.state === 'running'"
+        <button @click="startGateway()" :disabled="isGatewayRunning || isGatewayTransitioning"
           class="px-3 py-2 bg-gray-900 border border-gray-800 hover:border-gray-600 hover:bg-gray-800 text-xs font-medium rounded-lg text-gray-400 hover:text-white transition disabled:opacity-50 disabled:cursor-not-allowed">
           Start
         </button>
-        <button @click="stopGateway()" :disabled="status.gateway?.state === 'stopped'"
+        <button @click="stopGateway()" :disabled="!isGatewayRunning || isGatewayTransitioning"
           class="px-3 py-2 bg-gray-900 border border-red-900/30 hover:border-red-800/50 hover:bg-gray-800 text-xs font-medium rounded-lg text-red-500 transition disabled:opacity-50 disabled:cursor-not-allowed">
           Stop
         </button>
@@ -759,6 +759,18 @@
           return this._enabledChannelsFromConfig();
         },
 
+        get gatewayState() {
+          return this.status?.gateway?.state || 'stopped';
+        },
+
+        get isGatewayRunning() {
+          return this.gatewayState === 'running';
+        },
+
+        get isGatewayTransitioning() {
+          return ['starting', 'stopping'].includes(this.gatewayState);
+        },
+
         _enabledChannelsFromConfig() {
           const ch = this.config?.channels || {};
           let n = 0;
@@ -981,12 +993,14 @@
         },
 
         async startGateway() {
+          if (this.isGatewayRunning || this.isGatewayTransitioning) return;
           await fetch('/api/gateway/start', { method: 'POST' });
           this.showToast('Starting gateway...', 'success');
           setTimeout(() => this.loadStatus(), 1000);
         },
 
         async stopGateway() {
+          if (!this.isGatewayRunning || this.isGatewayTransitioning) return;
           await fetch('/api/gateway/stop', { method: 'POST' });
           this.showToast('Stopping gateway...', 'success');
           setTimeout(() => this.loadStatus(), 1000);

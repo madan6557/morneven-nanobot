@@ -176,7 +176,6 @@ class GatewayManager:
 
 gateway = GatewayManager()
 config_lock = asyncio.Lock()
-gateway_start_lock = asyncio.Lock()
 morneven_sync_lock = asyncio.Lock()
 
 
@@ -452,12 +451,10 @@ async def homepage(request: Request):
     auth_err = require_auth(request)
     if auth_err:
         return auth_err
-    await ensure_gateway_started()
     return templates.TemplateResponse(request, "index.html")
 
 
 async def health(request: Request):
-    await ensure_gateway_started()
     return JSONResponse({"status": "ok", "gateway": gateway.state, "morneven": load_morneven_runtime_state()})
 
 
@@ -647,25 +644,6 @@ async def api_morneven_reload(request: Request):
         return JSONResponse({"ok": True, "result": result, "gateway": gateway.get_status()})
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-
-
-async def auto_start_gateway():
-    await sync_morneven_runtime(strict=False)
-    config = load_config()
-    if config.get_api_key():
-        await gateway.start()
-
-
-async def ensure_gateway_started():
-    # Railway template sometimes runs with Starlette versions that don't support
-    # `on_startup` in Starlette(app=...). So we auto-start gateway lazily on
-    # the first incoming request to authenticated pages / healthcheck.
-    if gateway.state == "running":
-        return
-    async with gateway_start_lock:
-        if gateway.state == "running":
-            return
-        await auto_start_gateway()
 
 
 routes = [
