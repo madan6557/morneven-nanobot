@@ -84,6 +84,16 @@ def require_auth(request: Request):
     return None
 
 
+def require_morneven_token(request: Request):
+    expected = NANOBOT_MORNEVEN_RELOAD_TOKEN
+    provided = request.headers.get("x-morneven-reload-token", "")
+    if not expected:
+        return JSONResponse({"error": "NANOBOT_MORNEVEN_RELOAD_TOKEN is not configured"}, status_code=503)
+    if not secrets.compare_digest(provided, expected):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    return None
+
+
 class GatewayManager:
     def __init__(self):
         self.process: asyncio.subprocess.Process | None = None
@@ -551,13 +561,65 @@ async def api_gateway_restart(request: Request):
     return JSONResponse({"ok": True})
 
 
+async def api_morneven_status(request: Request):
+    auth_err = require_morneven_token(request)
+    if auth_err:
+        return auth_err
+    return JSONResponse({
+        "ok": True,
+        "gateway": gateway.get_status(),
+        "morneven": load_morneven_runtime_state(),
+        "logs": list(gateway.logs)[-50:],
+    })
+
+
+async def api_morneven_gateway_start(request: Request):
+    auth_err = require_morneven_token(request)
+    if auth_err:
+        return auth_err
+    sync_result = await sync_morneven_runtime(strict=False)
+    await gateway.start()
+    return JSONResponse({
+        "ok": True,
+        "action": "start",
+        "sync": sync_result,
+        "gateway": gateway.get_status(),
+        "morneven": load_morneven_runtime_state(),
+    })
+
+
+async def api_morneven_gateway_stop(request: Request):
+    auth_err = require_morneven_token(request)
+    if auth_err:
+        return auth_err
+    await gateway.stop()
+    return JSONResponse({
+        "ok": True,
+        "action": "stop",
+        "gateway": gateway.get_status(),
+        "morneven": load_morneven_runtime_state(),
+    })
+
+
+async def api_morneven_gateway_restart(request: Request):
+    auth_err = require_morneven_token(request)
+    if auth_err:
+        return auth_err
+    sync_result = await sync_morneven_runtime(strict=False)
+    await gateway.restart()
+    return JSONResponse({
+        "ok": True,
+        "action": "restart",
+        "sync": sync_result,
+        "gateway": gateway.get_status(),
+        "morneven": load_morneven_runtime_state(),
+    })
+
+
 async def api_morneven_reload(request: Request):
-    expected = NANOBOT_MORNEVEN_RELOAD_TOKEN
-    provided = request.headers.get("x-morneven-reload-token", "")
-    if not expected:
-        return JSONResponse({"error": "NANOBOT_MORNEVEN_RELOAD_TOKEN is not configured"}, status_code=503)
-    if not secrets.compare_digest(provided, expected):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    auth_err = require_morneven_token(request)
+    if auth_err:
+        return auth_err
 
     try:
         result = await sync_morneven_runtime(strict=True)
@@ -596,6 +658,10 @@ routes = [
     Route("/api/gateway/start", api_gateway_start, methods=["POST"]),
     Route("/api/gateway/stop", api_gateway_stop, methods=["POST"]),
     Route("/api/gateway/restart", api_gateway_restart, methods=["POST"]),
+    Route("/api/morneven/status", api_morneven_status),
+    Route("/api/morneven/gateway/start", api_morneven_gateway_start, methods=["POST"]),
+    Route("/api/morneven/gateway/stop", api_morneven_gateway_stop, methods=["POST"]),
+    Route("/api/morneven/gateway/restart", api_morneven_gateway_restart, methods=["POST"]),
     Route("/api/morneven/reload", api_morneven_reload, methods=["POST"]),
 ]
 
