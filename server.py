@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
@@ -51,6 +52,8 @@ WORKSPACE_PATH = Path(
     os.environ.get("NANOBOT_AGENTS__DEFAULTS__WORKSPACE", str(Path.home() / ".nanobot" / "workspace"))
 ).expanduser()
 RUNTIME_STATE_PATH = WORKSPACE_PATH / ".morneven-runtime.json"
+RUNTIME_MANIFEST_PATH = WORKSPACE_PATH / ".morneven-runtime-manifest.json"
+MAX_WORKSPACE_SYNC_BYTES = 500_000
 
 if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = secrets.token_urlsafe(16)
@@ -166,10 +169,14 @@ class GatewayManager:
         uptime = None
         if self.start_time and self.state == "running":
             uptime = int(time.time() - self.start_time)
+        started_at = None
+        if self.start_time and self.state == "running":
+            started_at = datetime.fromtimestamp(self.start_time, timezone.utc).isoformat()
         return {
             "state": self.state,
             "pid": pid,
             "uptime": uptime,
+            "startedAt": started_at,
             "restart_count": self.restart_count,
         }
 
@@ -304,6 +311,134 @@ def resolve_workspace_file(relative_path):
     return target
 
 
+def workspace_content_hash(content):
+    if isinstance(content, str):
+        raw = content.encode("utf-8")
+    else:
+        raw = bytes(content)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def infer_workspace_kind(relative_path):
+    normalized = relative_path.lower()
+    filename = normalized.rsplit("/", 1)[-1]
+    if filename in {"agents.md", "soul.md", "lore.md"}:
+        return "identity"
+    if filename == "memory.md" or normalized.startswith("memory/"):
+        return "memory"
+    if normalized.startswith("cron/"):
+        return "cron"
+    if normalized.startswith("sessions/"):
+        return "session"
+    if normalized.startswith("skills/"):
+        return "skill"
+    if filename == "tools.md" or normalized.startswith("tools/"):
+        return "tool"
+    if filename == "user.md":
+        return "user"
+    if filename == "heartbeat.md":
+        return "system"
+    return "other"
+
+
+def load_runtime_manifest():
+    try:
+        if RUNTIME_MANIFEST_PATH.exists():
+            payload = json.loads(RUNTIME_MANIFEST_PATH.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                files = payload.get("files")
+                if isinstance(files, dict):
+                    return payload
+    except Exception:
+        pass
+    return {"version": 1, "syncedAt": None, "files": {}}
+
+
+def write_runtime_manifest(files, active_identity=None):
+    manifest = {
+        "version": 1,
+        "syncedAt": now_iso(),
+        "identity": active_identity or {},
+        "files": {
+            item["path"]: {
+                "contentHash": item["contentHash"],
+                "size": item["size"],
+                "syncedAt": item["syncedAt"],
+            }
+            for item in files
+        },
+    }
+    RUNTIME_MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def iter_workspace_files():
+    if not WORKSPACE_PATH.exists():
+        return
+    internal_paths = {
+        normalize_runtime_path(str(RUNTIME_STATE_PATH.relative_to(WORKSPACE_PATH))),
+        normalize_runtime_path(str(RUNTIME_MANIFEST_PATH.relative_to(WORKSPACE_PATH))),
+    }
+    for path in WORKSPACE_PATH.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            relative_path = normalize_runtime_path(path.relative_to(WORKSPACE_PATH).as_posix())
+        except ValueError:
+            continue
+        if relative_path in internal_paths:
+            continue
+        yield relative_path, path
+
+
+def read_workspace_text(path):
+    stat = path.stat()
+    if stat.st_size > MAX_WORKSPACE_SYNC_BYTES:
+        raise ValueError("File exceeds workspace sync size limit")
+    raw = path.read_bytes()
+    if b"\x00" in raw:
+        raise ValueError("Binary files are not supported")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("File is not valid UTF-8") from exc
+    return content, stat
+
+
+def list_workspace_changes():
+    manifest = load_runtime_manifest()
+    manifest_files = manifest.get("files", {}) if isinstance(manifest.get("files"), dict) else {}
+    changes = []
+    skipped = []
+    for relative_path, path in iter_workspace_files():
+        try:
+            content, stat = read_workspace_text(path)
+            content_hash = workspace_content_hash(content)
+            base = manifest_files.get(relative_path, {}) if isinstance(manifest_files.get(relative_path), dict) else {}
+            base_hash = base.get("contentHash") if isinstance(base.get("contentHash"), str) else None
+            if base_hash == content_hash:
+                continue
+            changes.append({
+                "path": relative_path,
+                "kind": infer_workspace_kind(relative_path),
+                "content": content,
+                "contentHash": content_hash,
+                "baseHash": base_hash,
+                "size": stat.st_size,
+                "updatedAt": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            })
+        except Exception as exc:
+            skipped.append({"path": relative_path, "reason": str(exc)})
+    changes.sort(key=lambda item: item["path"])
+    skipped.sort(key=lambda item: item["path"])
+    return {
+        "syncedAt": manifest.get("syncedAt"),
+        "changedCount": len(changes),
+        "changes": changes,
+        "skipped": skipped,
+    }
+
+
 def merge_deep(target, source):
     if not isinstance(target, dict) or not isinstance(source, dict):
         return source
@@ -378,6 +513,8 @@ def materialize_morneven_runtime(bundle):
         raise ValueError("Runtime bundle must be an object")
 
     WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
+    previous_manifest = load_runtime_manifest()
+    previous_files = previous_manifest.get("files", {}) if isinstance(previous_manifest.get("files"), dict) else {}
     written = []
     files = bundle.get("files", [])
     if not isinstance(files, list):
@@ -390,8 +527,25 @@ def materialize_morneven_runtime(bundle):
         target = resolve_workspace_file(relative_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         content = item.get("content", "")
-        target.write_text(str(content), encoding="utf-8")
-        written.append(relative_path)
+        content_text = str(content)
+        target.write_text(content_text, encoding="utf-8")
+        written.append({
+            "path": relative_path,
+            "contentHash": workspace_content_hash(content_text),
+            "size": len(content_text.encode("utf-8")),
+            "syncedAt": now_iso(),
+        })
+
+    written_paths = {item["path"] for item in written}
+    for previous_path in previous_files:
+        if previous_path in written_paths:
+            continue
+        try:
+            target = resolve_workspace_file(normalize_runtime_path(previous_path))
+            if target.exists() and target.is_file():
+                target.unlink()
+        except Exception:
+            continue
 
     active_identity = bundle.get("activeIdentity") if isinstance(bundle.get("activeIdentity"), dict) else {}
     state = {
@@ -404,9 +558,10 @@ def materialize_morneven_runtime(bundle):
             "roleTitle": active_identity.get("roleTitle"),
         },
         "fileCount": len(written),
-        "files": written,
+        "files": [item["path"] for item in written],
     }
     RUNTIME_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    write_runtime_manifest(written, state["identity"])
     apply_bundle_to_config(bundle)
     return state
 
@@ -590,6 +745,17 @@ async def api_morneven_status(request: Request):
     })
 
 
+async def api_morneven_workspace_changes(request: Request):
+    auth_err = require_morneven_token(request)
+    if auth_err:
+        return auth_err
+
+    try:
+        return JSONResponse({"ok": True, **list_workspace_changes()})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+
 async def api_morneven_gateway_start(request: Request):
     auth_err = require_morneven_token(request)
     if auth_err:
@@ -640,7 +806,6 @@ async def api_morneven_reload(request: Request):
 
     try:
         result = await sync_morneven_runtime(strict=True)
-        await gateway.restart()
         return JSONResponse({"ok": True, "result": result, "gateway": gateway.get_status()})
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
@@ -662,6 +827,7 @@ routes = [
     Route("/api/morneven/gateway/stop", api_morneven_gateway_stop, methods=["POST"]),
     Route("/api/morneven/gateway/restart", api_morneven_gateway_restart, methods=["POST"]),
     Route("/api/morneven/reload", api_morneven_reload, methods=["POST"]),
+    Route("/api/morneven/workspace/changes", api_morneven_workspace_changes),
 ]
 
 app = Starlette(
