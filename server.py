@@ -804,9 +804,24 @@ async def api_morneven_reload(request: Request):
     if auth_err:
         return auth_err
 
+    restart_gateway = False
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            restart_gateway = bool(body.get("restartGateway", False))
+    except Exception:
+        restart_gateway = False
+
     try:
         result = await sync_morneven_runtime(strict=True)
-        return JSONResponse({"ok": True, "result": result, "gateway": gateway.get_status()})
+        if restart_gateway:
+            await gateway.restart()
+        return JSONResponse({
+            "ok": True,
+            "result": result,
+            "gateway": gateway.get_status(),
+            "restarted": restart_gateway,
+        })
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
