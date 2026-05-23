@@ -12,10 +12,12 @@ RUN mkdir -p /data/.nanobot /app/img
 COPY server.py /app/server.py
 COPY templates/ /app/templates/
 COPY img/logo-white.png /app/img/logo-white.png
+COPY sitecustomize.py /app/sitecustomize.py
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
 ENV HOME=/data
+ENV PYTHONPATH=/app
 ENV NANOBOT_AGENTS__DEFAULTS__WORKSPACE=/data/.nanobot/workspace
 
 EXPOSE 8080

@@ -1,0 +1,135 @@
+"""Runtime compatibility patches for Morneven Nanobot."""
+
+from __future__ import annotations
+
+import inspect
+import re
+from typing import Any
+
+
+COMMAND_TARGET_RE = re.compile(r"^/[A-Za-z0-9_-]+@([A-Za-z0-9_]+)(?=$|\s)")
+LEADING_MENTION_RE = re.compile(r"^@([A-Za-z0-9_]+)(?=$|\s)")
+
+
+def _normalize_username(value: Any) -> str:
+    if not value:
+        return ""
+    return str(value).strip().lstrip("@").lower()
+
+
+def _message_text(message: Any) -> str:
+    text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    return str(text).strip()
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _bot_username(channel: Any) -> str:
+    cached = _normalize_username(getattr(channel, "_bot_username", None))
+    if cached:
+        return cached
+
+    ensure_identity = getattr(channel, "_ensure_bot_identity", None)
+    if callable(ensure_identity):
+        try:
+            _, username = await _maybe_await(ensure_identity())
+            username = _normalize_username(username)
+            if username:
+                return username
+        except Exception:
+            return ""
+
+    return ""
+
+
+async def _targeted_at_other_bot(channel: Any, message: Any) -> bool:
+    text = _message_text(message)
+    if not text:
+        return False
+
+    username = await _bot_username(channel)
+    if not username:
+        return False
+
+    command_match = COMMAND_TARGET_RE.match(text)
+    if command_match:
+        return _normalize_username(command_match.group(1)) != username
+
+    mention_match = LEADING_MENTION_RE.match(text)
+    if mention_match:
+        return _normalize_username(mention_match.group(1)) != username
+
+    return False
+
+
+async def _command_allowed_for_group(channel: Any, message: Any) -> bool:
+    chat = getattr(message, "chat", None)
+    if getattr(chat, "type", None) == "private":
+        return True
+
+    checker = getattr(channel, "_is_group_message_for_bot", None)
+    if callable(checker):
+        try:
+            return bool(await _maybe_await(checker(message)))
+        except Exception:
+            return False
+
+    return True
+
+
+def _patch_telegram_channel() -> None:
+    try:
+        from nanobot.channels.telegram import TelegramChannel
+    except Exception:
+        return
+
+    original_forward_command = getattr(TelegramChannel, "_forward_command", None)
+    if original_forward_command and not getattr(original_forward_command, "_morneven_target_filter", False):
+
+        async def _forward_command(self: Any, update: Any, context: Any) -> None:
+            message = getattr(update, "message", None)
+            if message is not None:
+                if await _targeted_at_other_bot(self, message):
+                    return
+                if not await _command_allowed_for_group(self, message):
+                    return
+            await original_forward_command(self, update, context)
+
+        _forward_command._morneven_target_filter = True  # type: ignore[attr-defined]
+        TelegramChannel._forward_command = _forward_command
+
+    for method_name in ("_on_start", "_on_help"):
+        original = getattr(TelegramChannel, method_name, None)
+        if not original or getattr(original, "_morneven_target_filter", False):
+            continue
+
+        async def _command_handler(self: Any, update: Any, context: Any, _original: Any = original) -> None:
+            message = getattr(update, "message", None)
+            if message is not None:
+                if await _targeted_at_other_bot(self, message):
+                    return
+                if not await _command_allowed_for_group(self, message):
+                    return
+            await _original(self, update, context)
+
+        _command_handler._morneven_target_filter = True  # type: ignore[attr-defined]
+        setattr(TelegramChannel, method_name, _command_handler)
+
+    original_on_message = getattr(TelegramChannel, "_on_message", None)
+    if original_on_message and not getattr(original_on_message, "_morneven_target_filter", False):
+
+        async def _on_message(self: Any, update: Any, context: Any) -> None:
+            message = getattr(update, "message", None)
+            if message is not None and await _targeted_at_other_bot(self, message):
+                return
+            await original_on_message(self, update, context)
+
+        _on_message._morneven_target_filter = True  # type: ignore[attr-defined]
+        TelegramChannel._on_message = _on_message
+
+
+_patch_telegram_channel()
