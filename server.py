@@ -37,7 +37,26 @@ from nanobot.config.loader import (
 from nanobot.config.schema import Config
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
-SECRET_FIELDS = {"api_key", "apiKey", "token", "app_secret", "appSecret", "encrypt_key", "encryptKey", "verification_token", "verificationToken"}
+SECRET_FIELDS = {
+    "api_key",
+    "apiKey",
+    "token",
+    "bot_token",
+    "botToken",
+    "app_token",
+    "appToken",
+    "app_secret",
+    "appSecret",
+    "signing_secret",
+    "signingSecret",
+    "encrypt_key",
+    "encryptKey",
+    "verification_token",
+    "verificationToken",
+    "secret",
+    "webhook_url",
+    "webhookUrl",
+}
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -756,6 +775,22 @@ async def api_morneven_workspace_changes(request: Request):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
 
+async def api_morneven_config_secrets(request: Request):
+    auth_err = require_morneven_token(request)
+    if auth_err:
+        return auth_err
+
+    config = load_config()
+    data = config.model_dump(by_alias=True)
+    return JSONResponse({
+        "ok": True,
+        "providers": data.get("providers", {}),
+        "channels": data.get("channels", {}),
+        "tools": data.get("tools", {}),
+        "agents": data.get("agents", {}),
+    })
+
+
 async def api_morneven_gateway_start(request: Request):
     auth_err = require_morneven_token(request)
     if auth_err:
@@ -843,6 +878,7 @@ routes = [
     Route("/api/morneven/gateway/restart", api_morneven_gateway_restart, methods=["POST"]),
     Route("/api/morneven/reload", api_morneven_reload, methods=["POST"]),
     Route("/api/morneven/workspace/changes", api_morneven_workspace_changes),
+    Route("/api/morneven/config-secrets", api_morneven_config_secrets),
 ]
 
 app = Starlette(
