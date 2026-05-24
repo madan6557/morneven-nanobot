@@ -999,7 +999,12 @@
               body: JSON.stringify(payload),
             });
             if (res.ok) {
-              this.showToast('Configuration saved successfully', 'success');
+              const data = await res.json().catch(() => ({}));
+              if (data.mornevenSync && data.mornevenSync.synced === false) {
+                this.showToast('Configuration saved, Morneven sync warning: ' + (data.mornevenSync.reason || 'unknown'), 'error');
+              } else {
+                this.showToast('Configuration saved successfully', 'success');
+              }
               await this.loadConfig();
               await this.loadStatus();
             } else {

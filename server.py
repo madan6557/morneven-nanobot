@@ -280,6 +280,12 @@ def bot_manager_bundle_url(base_url):
     return f"{base_url}/api/bot-manager/runtime/bundle"
 
 
+def bot_manager_config_secrets_url(base_url):
+    if base_url.endswith("/api"):
+        return f"{base_url}/bot-manager/runtime/config-secrets"
+    return f"{base_url}/api/bot-manager/runtime/config-secrets"
+
+
 def fetch_morneven_runtime_bundle():
     if not MORNEVEN_BOT_MANAGER_SYNC_TOKEN:
         raise RuntimeError("MORNEVEN_BOT_MANAGER_SYNC_TOKEN is not configured")
@@ -308,6 +314,44 @@ def fetch_morneven_runtime_bundle():
             last_error = exc
 
     raise RuntimeError(f"Unable to fetch Morneven runtime bundle: {last_error}")
+
+
+def push_morneven_config_secrets(config_data):
+    if not MORNEVEN_BOT_MANAGER_SYNC_TOKEN:
+        return {"synced": False, "reason": "MORNEVEN_BOT_MANAGER_SYNC_TOKEN is not configured"}
+    urls = backend_base_urls()
+    if not urls:
+        return {"synced": False, "reason": "Morneven backend URL is not configured"}
+
+    payload = {
+        "providers": config_data.get("providers", {}) if isinstance(config_data, dict) else {},
+        "channels": config_data.get("channels", {}) if isinstance(config_data, dict) else {},
+        "tools": config_data.get("tools", {}) if isinstance(config_data, dict) else {},
+        "agents": config_data.get("agents", {}) if isinstance(config_data, dict) else {},
+        "morneven": load_morneven_runtime_state(),
+    }
+    body = json.dumps(payload).encode("utf-8")
+    last_error = None
+    for base_url in urls:
+        url = bot_manager_config_secrets_url(base_url)
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "accept": "application/json",
+                "content-type": "application/json",
+                "x-bot-manager-sync-token": MORNEVEN_BOT_MANAGER_SYNC_TOKEN,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+                return {"synced": True, "response": response_payload}
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = exc
+
+    return {"synced": False, "reason": f"Unable to push Morneven config secrets: {last_error}"}
 
 
 def normalize_runtime_path(value):
@@ -653,6 +697,7 @@ async def api_config_put(request: Request):
 
     try:
         restart = body.pop("_restartGateway", False)
+        saved_data = None
 
         async with config_lock:
             existing_config = load_config()
@@ -671,11 +716,16 @@ async def api_config_put(request: Request):
                 return JSONResponse({"error": f"Validation error: {err_msg}"}, status_code=400)
 
             save_config(new_config)
+            saved_data = new_config.model_dump(by_alias=True)
+
+        morneven_sync = await asyncio.to_thread(push_morneven_config_secrets, saved_data or {})
+        if not morneven_sync.get("synced"):
+            gateway.logs.append(f"Morneven config secret push skipped: {morneven_sync.get('reason')}")
 
         if restart:
             asyncio.create_task(gateway.restart())
 
-        return JSONResponse({"ok": True, "restarting": restart})
+        return JSONResponse({"ok": True, "restarting": restart, "mornevenSync": morneven_sync})
     except Exception as e:
         print(f"Config save error: {type(e).__name__}: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
