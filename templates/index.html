@@ -201,6 +201,40 @@
         </div>
       </div>
 
+      <div class="bg-gray-900/30 border border-gray-800 rounded-xl p-6">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="text-xs font-bold text-gray-600 uppercase tracking-widest">Morneven Runtimes</h3>
+          <span class="text-xs text-gray-500" x-text="runtimeList.length + ' active personality runtime(s)'"></span>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <template x-for="runtime in runtimeList" :key="runtime.identityId || runtime.name">
+            <div class="border border-gray-800 rounded-lg p-4 bg-black/40">
+              <div class="flex items-start justify-between gap-3">
+                <div>
+                  <div class="flex items-center gap-2">
+                    <p class="font-medium" x-text="runtime.name || runtime.slug || runtime.identityId"></p>
+                    <span x-show="runtime.isMain" class="px-2 py-0.5 rounded border border-gray-700 text-[10px] text-gray-400">MAIN</span>
+                  </div>
+                  <p class="text-xs text-gray-500 mt-1" x-text="runtime.slug || 'runtime workspace'"></p>
+                </div>
+                <span class="text-xs uppercase" :class="runtime.state === 'running' ? 'text-emerald-400' : 'text-gray-500'" x-text="runtime.state || 'stopped'"></span>
+              </div>
+              <div class="grid grid-cols-3 gap-2 mt-4">
+                <button @click="startRuntime(runtime.identityId)" :disabled="runtime.state === 'running' || runtime.state === 'starting'"
+                  class="px-2 py-1.5 rounded bg-gray-900 border border-gray-800 text-xs text-gray-300 disabled:opacity-40">Start</button>
+                <button @click="stopRuntime(runtime.identityId)" :disabled="runtime.state !== 'running'"
+                  class="px-2 py-1.5 rounded bg-gray-900 border border-gray-800 text-xs text-gray-300 disabled:opacity-40">Stop</button>
+                <button @click="restartRuntime(runtime.identityId)" :disabled="runtime.state !== 'running'"
+                  class="px-2 py-1.5 rounded bg-gray-900 border border-gray-800 text-xs text-gray-300 disabled:opacity-40">Restart</button>
+              </div>
+            </div>
+          </template>
+          <div x-show="runtimeList.length === 0" class="border border-gray-800 rounded-lg p-4 text-sm text-gray-500 bg-black/40">
+            No Morneven runtime bundle has been synced yet.
+          </div>
+        </div>
+      </div>
+
       <!-- Setup Workflow Guide -->
       <div class="bg-gray-900/30 border border-gray-800 rounded-xl p-8">
         <h3 class="text-lg font-medium mb-6">Setup Workflow</h3>
@@ -768,6 +802,11 @@
           return this.status?.gateway?.state || 'stopped';
         },
 
+        get runtimeList() {
+          const runtimes = this.status?.gateway?.runtimes || this.status?.morneven?.runtimes || [];
+          return Array.isArray(runtimes) ? runtimes : [];
+        },
+
         get isGatewayRunning() {
           return this.gatewayState === 'running';
         },
@@ -1051,6 +1090,27 @@
           if (!this.isGatewayRunning || this.isGatewayTransitioning) return;
           await fetch('/api/gateway/stop', { method: 'POST' });
           this.showToast('Stopping gateway...', 'success');
+          setTimeout(() => this.loadStatus(), 1000);
+        },
+
+        async startRuntime(identityId) {
+          if (!identityId) return;
+          await fetch(`/api/runtimes/${encodeURIComponent(identityId)}/gateway/start`, { method: 'POST' });
+          this.showToast('Starting runtime...', 'success');
+          setTimeout(() => this.loadStatus(), 1000);
+        },
+
+        async stopRuntime(identityId) {
+          if (!identityId) return;
+          await fetch(`/api/runtimes/${encodeURIComponent(identityId)}/gateway/stop`, { method: 'POST' });
+          this.showToast('Stopping runtime...', 'success');
+          setTimeout(() => this.loadStatus(), 1000);
+        },
+
+        async restartRuntime(identityId) {
+          if (!identityId) return;
+          await fetch(`/api/runtimes/${encodeURIComponent(identityId)}/gateway/restart`, { method: 'POST' });
+          this.showToast('Restarting runtime...', 'success');
           setTimeout(() => this.loadStatus(), 1000);
         },
 

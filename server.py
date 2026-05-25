@@ -70,6 +70,7 @@ NANOBOT_MORNEVEN_RELOAD_TOKEN = os.environ.get("NANOBOT_MORNEVEN_RELOAD_TOKEN", 
 WORKSPACE_PATH = Path(
     os.environ.get("NANOBOT_AGENTS__DEFAULTS__WORKSPACE", str(Path.home() / ".nanobot" / "workspace"))
 ).expanduser()
+RUNTIMES_ROOT = WORKSPACE_PATH.parent / "runtimes"
 RUNTIME_STATE_PATH = WORKSPACE_PATH / ".morneven-runtime.json"
 RUNTIME_MANIFEST_PATH = WORKSPACE_PATH / ".morneven-runtime-manifest.json"
 MAX_WORKSPACE_SYNC_BYTES = 500_000
@@ -121,7 +122,10 @@ def require_morneven_token(request: Request):
 
 
 class GatewayManager:
-    def __init__(self):
+    def __init__(self, identity_id="main", name="Main", config_path=None):
+        self.identity_id = identity_id
+        self.name = name
+        self.config_path = Path(config_path).expanduser() if config_path else None
         self.process: asyncio.subprocess.Process | None = None
         self.state = "stopped"
         self.logs: deque[str] = deque(maxlen=500)
@@ -134,8 +138,11 @@ class GatewayManager:
             return
         self.state = "starting"
         try:
+            command = ["nanobot", "gateway"]
+            if self.config_path:
+                command.extend(["--config", str(self.config_path)])
             self.process = await asyncio.create_subprocess_exec(
-                "nanobot", "gateway",
+                *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -174,7 +181,7 @@ class GatewayManager:
                     break
                 decoded = line.decode("utf-8", errors="replace").rstrip()
                 cleaned = ANSI_ESCAPE.sub("", decoded)
-                self.logs.append(cleaned)
+                self.logs.append(f"[{self.name}] {cleaned}")
         except asyncio.CancelledError:
             return
         if self.process and self.process.returncode is not None and self.state == "running":
@@ -193,6 +200,8 @@ class GatewayManager:
             started_at = datetime.fromtimestamp(self.start_time, timezone.utc).isoformat()
         return {
             "state": self.state,
+            "identityId": self.identity_id,
+            "name": self.name,
             "pid": pid,
             "uptime": uptime,
             "startedAt": started_at,
@@ -200,7 +209,121 @@ class GatewayManager:
         }
 
 
-gateway = GatewayManager()
+class MultiGatewayManager:
+    def __init__(self):
+        self.gateways: dict[str, GatewayManager] = {}
+        self.logs: deque[str] = deque(maxlen=800)
+
+    @property
+    def state(self):
+        main = self.main_gateway()
+        return main.state if main else "stopped"
+
+    def runtime_state(self):
+        return load_morneven_runtime_state()
+
+    def runtimes_from_state(self):
+        state = self.runtime_state()
+        runtimes = state.get("runtimes") if isinstance(state, dict) else None
+        return runtimes if isinstance(runtimes, list) else []
+
+    def main_runtime_id(self):
+        state = self.runtime_state()
+        main = state.get("mainIdentity") if isinstance(state, dict) else None
+        if isinstance(main, dict) and main.get("id"):
+            return str(main["id"])
+        runtimes = self.runtimes_from_state()
+        for runtime in runtimes:
+            if isinstance(runtime, dict) and runtime.get("isMain") and runtime.get("identityId"):
+                return str(runtime["identityId"])
+        for runtime in runtimes:
+            if isinstance(runtime, dict) and runtime.get("identityId"):
+                return str(runtime["identityId"])
+        return "main"
+
+    def runtime_config(self, identity_id):
+        for runtime in self.runtimes_from_state():
+            if isinstance(runtime, dict) and str(runtime.get("identityId")) == str(identity_id):
+                return runtime
+        return None
+
+    def ensure_gateway(self, identity_id=None):
+        runtime = self.runtime_config(identity_id or self.main_runtime_id())
+        if runtime:
+            runtime_id = str(runtime["identityId"])
+            name = str(runtime.get("name") or runtime_id)
+            config_path = runtime.get("configPath")
+        else:
+            runtime_id = str(identity_id or "main")
+            name = "Main"
+            config_path = None
+        manager = self.gateways.get(runtime_id)
+        if not manager:
+            manager = GatewayManager(runtime_id, name, config_path)
+            self.gateways[runtime_id] = manager
+        else:
+            manager.name = name
+            manager.config_path = Path(config_path).expanduser() if config_path else None
+        return manager
+
+    def main_gateway(self):
+        return self.ensure_gateway(self.main_runtime_id())
+
+    async def start(self):
+        await self.start_identity(self.main_runtime_id())
+
+    async def stop(self):
+        await self.stop_identity(self.main_runtime_id())
+
+    async def restart(self):
+        await self.restart_identity(self.main_runtime_id())
+
+    async def start_identity(self, identity_id):
+        manager = self.ensure_gateway(identity_id)
+        await manager.start()
+        self.logs.append(f"Started runtime: {manager.name}")
+
+    async def stop_identity(self, identity_id):
+        manager = self.ensure_gateway(identity_id)
+        await manager.stop()
+        self.logs.append(f"Stopped runtime: {manager.name}")
+
+    async def restart_identity(self, identity_id):
+        manager = self.ensure_gateway(identity_id)
+        await manager.restart()
+        self.logs.append(f"Restarted runtime: {manager.name}")
+
+    async def restart_running(self):
+        for identity_id, manager in list(self.gateways.items()):
+            if manager.state == "running":
+                await self.restart_identity(identity_id)
+
+    def get_status(self):
+        runtimes = []
+        seen = set()
+        for runtime in self.runtimes_from_state():
+            if not isinstance(runtime, dict) or not runtime.get("identityId"):
+                continue
+            identity_id = str(runtime["identityId"])
+            manager = self.ensure_gateway(identity_id)
+            seen.add(identity_id)
+            runtimes.append({
+                **manager.get_status(),
+                "slug": runtime.get("slug"),
+                "isMain": bool(runtime.get("isMain")),
+                "workspacePath": runtime.get("workspacePath"),
+            })
+        for identity_id, manager in self.gateways.items():
+            if identity_id not in seen:
+                runtimes.append(manager.get_status())
+        main = self.ensure_gateway(self.main_runtime_id())
+        return {
+            **main.get_status(),
+            "runtimes": runtimes,
+        }
+
+
+gateway = MultiGatewayManager()
 config_lock = asyncio.Lock()
 morneven_sync_lock = asyncio.Lock()
 
@@ -323,12 +446,16 @@ def push_morneven_config_secrets(config_data):
     if not urls:
         return {"synced": False, "reason": "Morneven backend URL is not configured"}
 
+    morneven_state = load_morneven_runtime_state()
+    identity = morneven_state.get("identity") if isinstance(morneven_state, dict) else {}
     payload = {
+        "identityId": identity.get("id") if isinstance(identity, dict) else None,
+        "identity": identity if isinstance(identity, dict) else {},
         "providers": config_data.get("providers", {}) if isinstance(config_data, dict) else {},
         "channels": config_data.get("channels", {}) if isinstance(config_data, dict) else {},
         "tools": config_data.get("tools", {}) if isinstance(config_data, dict) else {},
         "agents": config_data.get("agents", {}) if isinstance(config_data, dict) else {},
-        "morneven": load_morneven_runtime_state(),
+        "morneven": morneven_state,
     }
     body = json.dumps(payload).encode("utf-8")
     last_error = None
@@ -435,6 +562,59 @@ def write_runtime_manifest(files, active_identity=None):
     return manifest
 
 
+def runtime_slug(identity):
+    raw = ""
+    if isinstance(identity, dict):
+        raw = str(identity.get("slug") or identity.get("name") or identity.get("id") or "")
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw.strip().lower()).strip("-")
+    return slug or "identity"
+
+
+def runtime_dir_for_identity(identity):
+    identity_id = str(identity.get("id") or runtime_slug(identity)) if isinstance(identity, dict) else "identity"
+    slug = runtime_slug(identity)
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", identity_id).strip("-") or slug
+    return RUNTIMES_ROOT / f"{slug}-{safe_id[:8]}"
+
+
+def load_manifest_at(manifest_path):
+    try:
+        if manifest_path.exists():
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("files"), dict):
+                return payload
+    except Exception:
+        pass
+    return {"version": 1, "syncedAt": None, "files": {}}
+
+
+def write_manifest_at(manifest_path, files, active_identity=None):
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "version": 1,
+        "syncedAt": now_iso(),
+        "identity": active_identity or {},
+        "files": {
+            item["path"]: {
+                "contentHash": item["contentHash"],
+                "size": item["size"],
+                "syncedAt": item["syncedAt"],
+            }
+            for item in files
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def resolve_runtime_workspace_file(workspace_root, relative_path):
+    root = Path(workspace_root).resolve()
+    target = (root / Path(*relative_path.split("/"))).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError("Runtime file path escaped workspace")
+    return target
+
+
 def iter_workspace_files():
     if not WORKSPACE_PATH.exists():
         return
@@ -502,6 +682,46 @@ def list_workspace_changes():
     }
 
 
+def list_workspace_changes_at(workspace_root, manifest_path):
+    workspace_root = Path(workspace_root)
+    manifest = load_manifest_at(Path(manifest_path))
+    manifest_files = manifest.get("files", {}) if isinstance(manifest.get("files"), dict) else {}
+    changes = []
+    skipped = []
+    if not workspace_root.exists():
+        return {"syncedAt": manifest.get("syncedAt"), "changedCount": 0, "changes": [], "skipped": []}
+    for path in workspace_root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            relative_path = normalize_runtime_path(path.relative_to(workspace_root).as_posix())
+            content, stat = read_workspace_text(path)
+            content_hash = workspace_content_hash(content)
+            base = manifest_files.get(relative_path, {}) if isinstance(manifest_files.get(relative_path), dict) else {}
+            base_hash = base.get("contentHash") if isinstance(base.get("contentHash"), str) else None
+            if base_hash == content_hash:
+                continue
+            changes.append({
+                "path": relative_path,
+                "kind": infer_workspace_kind(relative_path),
+                "content": content,
+                "contentHash": content_hash,
+                "baseHash": base_hash,
+                "size": stat.st_size,
+                "updatedAt": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            })
+        except Exception as exc:
+            skipped.append({"path": path.name, "reason": str(exc)})
+    changes.sort(key=lambda item: item["path"])
+    skipped.sort(key=lambda item: item["path"])
+    return {
+        "syncedAt": manifest.get("syncedAt"),
+        "changedCount": len(changes),
+        "changes": changes,
+        "skipped": skipped,
+    }
+
+
 def merge_deep(target, source):
     if not isinstance(target, dict) or not isinstance(source, dict):
         return source
@@ -514,7 +734,7 @@ def merge_deep(target, source):
     return result
 
 
-def apply_bundle_to_config(bundle):
+def apply_bundle_to_config(bundle, workspace_path=WORKSPACE_PATH, config_path=None, persist_default=True):
     config = load_config()
     data = config.model_dump(by_alias=True)
 
@@ -559,7 +779,7 @@ def apply_bundle_to_config(bundle):
 
     agents = data.setdefault("agents", {})
     defaults = agents.setdefault("defaults", {})
-    defaults["workspace"] = str(WORKSPACE_PATH)
+    defaults["workspace"] = str(workspace_path)
     preferred_provider = defaults.get("provider")
     if preferred_provider in credential_models:
         defaults["model"] = credential_models[preferred_provider]
@@ -568,18 +788,45 @@ def apply_bundle_to_config(bundle):
         defaults["provider"] = provider
         defaults["model"] = model_id
 
-    save_config(Config.model_validate(data))
+    validated = Config.model_validate(data)
+    if config_path:
+        config_path = Path(config_path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(validated.model_dump(by_alias=True), indent=2), encoding="utf-8")
+    if persist_default:
+        save_config(validated)
+    return validated.model_dump(by_alias=True)
 
 
-def materialize_morneven_runtime(bundle):
+def runtime_entries_from_bundle(bundle):
     if not isinstance(bundle, dict):
         raise ValueError("Runtime bundle must be an object")
+    entries = bundle.get("identities")
+    if isinstance(entries, list) and entries:
+        return [entry for entry in entries if isinstance(entry, dict) and isinstance(entry.get("identity"), dict)]
+    identity = bundle.get("activeIdentity") if isinstance(bundle.get("activeIdentity"), dict) else bundle.get("mainIdentity")
+    if not isinstance(identity, dict):
+        raise ValueError("Runtime bundle does not contain an active identity")
+    return [{
+        "identity": identity,
+        "credentials": bundle.get("credentials", {}),
+        "channels": bundle.get("channels", {}),
+        "settings": bundle.get("settings", {}),
+        "files": bundle.get("files", []),
+    }]
 
-    WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
-    previous_manifest = load_runtime_manifest()
+
+def materialize_runtime_entry(entry, general_config, mode, main_identity_id, persist_default=False):
+    identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else {}
+    runtime_dir = runtime_dir_for_identity(identity)
+    workspace_path = runtime_dir / "workspace"
+    manifest_path = runtime_dir / ".morneven-runtime-manifest.json"
+    config_path = runtime_dir / "config.json"
+    workspace_path.mkdir(parents=True, exist_ok=True)
+    previous_manifest = load_manifest_at(manifest_path)
     previous_files = previous_manifest.get("files", {}) if isinstance(previous_manifest.get("files"), dict) else {}
     written = []
-    files = bundle.get("files", [])
+    files = entry.get("files", [])
     if not isinstance(files, list):
         raise ValueError("Runtime bundle files must be a list")
 
@@ -587,10 +834,9 @@ def materialize_morneven_runtime(bundle):
         if not isinstance(item, dict):
             continue
         relative_path = normalize_runtime_path(item.get("path", ""))
-        target = resolve_workspace_file(relative_path)
+        target = resolve_runtime_workspace_file(workspace_path, relative_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        content = item.get("content", "")
-        content_text = str(content)
+        content_text = str(item.get("content", ""))
         target.write_text(content_text, encoding="utf-8")
         written.append({
             "path": relative_path,
@@ -604,28 +850,78 @@ def materialize_morneven_runtime(bundle):
         if previous_path in written_paths:
             continue
         try:
-            target = resolve_workspace_file(normalize_runtime_path(previous_path))
+            target = resolve_runtime_workspace_file(workspace_path, normalize_runtime_path(previous_path))
             if target.exists() and target.is_file():
                 target.unlink()
         except Exception:
             continue
 
-    active_identity = bundle.get("activeIdentity") if isinstance(bundle.get("activeIdentity"), dict) else {}
+    runtime_bundle = {
+        "credentials": entry.get("credentials", {}),
+        "channels": entry.get("channels", {}),
+        "settings": entry.get("settings", {}),
+        "generalConfig": general_config,
+    }
+    apply_bundle_to_config(runtime_bundle, workspace_path=workspace_path, config_path=config_path, persist_default=persist_default)
+    state = {
+        "identityId": identity.get("id"),
+        "slug": identity.get("slug"),
+        "name": identity.get("name"),
+        "roleTitle": identity.get("roleTitle"),
+        "isMain": identity.get("id") == main_identity_id or bool(identity.get("isMain")),
+        "workspacePath": str(workspace_path),
+        "configPath": str(config_path),
+        "fileCount": len(written),
+        "files": [item["path"] for item in written],
+        "syncedAt": now_iso(),
+    }
+    write_manifest_at(manifest_path, written, {
+        "id": state["identityId"],
+        "slug": state["slug"],
+        "name": state["name"],
+        "roleTitle": state["roleTitle"],
+    })
+    return state
+
+
+def materialize_morneven_runtime(bundle):
+    if not isinstance(bundle, dict):
+        raise ValueError("Runtime bundle must be an object")
+
+    WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
+    RUNTIMES_ROOT.mkdir(parents=True, exist_ok=True)
+    entries = runtime_entries_from_bundle(bundle)
+    main_identity = bundle.get("mainIdentity") if isinstance(bundle.get("mainIdentity"), dict) else bundle.get("activeIdentity", {})
+    main_identity_id = str(main_identity.get("id") or entries[0]["identity"].get("id"))
+    general_config = bundle.get("generalConfig") if isinstance(bundle.get("generalConfig"), dict) else {}
+    runtimes = []
+    for entry in entries:
+        identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else {}
+        persist_default = str(identity.get("id")) == main_identity_id
+        runtimes.append(materialize_runtime_entry(entry, general_config, bundle.get("mode", "single-active-personality"), main_identity_id, persist_default=persist_default))
+
+    main_runtime = next((runtime for runtime in runtimes if runtime.get("isMain")), runtimes[0])
     state = {
         "syncedAt": now_iso(),
         "mode": bundle.get("mode", "single-active-personality"),
-        "identity": {
-            "id": active_identity.get("id"),
-            "slug": active_identity.get("slug"),
-            "name": active_identity.get("name"),
-            "roleTitle": active_identity.get("roleTitle"),
+        "mainIdentity": {
+            "id": main_runtime.get("identityId"),
+            "slug": main_runtime.get("slug"),
+            "name": main_runtime.get("name"),
+            "roleTitle": main_runtime.get("roleTitle"),
         },
-        "fileCount": len(written),
-        "files": [item["path"] for item in written],
+        "identity": {
+            "id": main_runtime.get("identityId"),
+            "slug": main_runtime.get("slug"),
+            "name": main_runtime.get("name"),
+            "roleTitle": main_runtime.get("roleTitle"),
+        },
+        "runtimeCount": len(runtimes),
+        "runtimes": runtimes,
+        "fileCount": sum(runtime.get("fileCount", 0) for runtime in runtimes),
+        "files": main_runtime.get("files", []),
     }
     RUNTIME_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    write_runtime_manifest(written, state["identity"])
-    apply_bundle_to_config(bundle)
     return state
 
 
@@ -639,6 +935,9 @@ def load_morneven_runtime_state():
         "syncedAt": None,
         "mode": "single-active-personality",
         "identity": None,
+        "mainIdentity": None,
+        "runtimeCount": 0,
+        "runtimes": [],
         "fileCount": 0,
         "files": [],
     }
@@ -656,7 +955,7 @@ async def sync_morneven_runtime(strict=False):
             bundle = await asyncio.to_thread(fetch_morneven_runtime_bundle)
             state = await asyncio.to_thread(materialize_morneven_runtime, bundle)
             identity = state.get("identity") or {}
-            gateway.logs.append(f"Morneven runtime synced: {identity.get('name') or 'active personality'}")
+            gateway.logs.append(f"Morneven runtime synced: {state.get('runtimeCount', 1)} runtime(s), main {identity.get('name') or 'active personality'}")
             return {"synced": True, "state": state}
         except Exception as exc:
             gateway.logs.append(f"Morneven runtime sync failed: {exc}")
@@ -775,7 +1074,10 @@ async def api_logs(request: Request):
     auth_err = require_auth(request)
     if auth_err:
         return auth_err
-    return JSONResponse({"lines": list(gateway.logs)})
+    lines = list(gateway.logs)
+    for manager in gateway.gateways.values():
+        lines.extend(list(manager.logs)[-200:])
+    return JSONResponse({"lines": lines[-500:]})
 
 
 async def api_gateway_start(request: Request):
@@ -802,6 +1104,25 @@ async def api_gateway_restart(request: Request):
     return JSONResponse({"ok": True})
 
 
+async def api_runtime_gateway_action(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    identity_id = request.path_params.get("identity_id")
+    action = request.path_params.get("action")
+    if action not in {"start", "stop", "restart"}:
+        return JSONResponse({"ok": False, "error": "Invalid runtime action"}, status_code=404)
+    if action in {"start", "restart"}:
+        await sync_morneven_runtime(strict=False)
+    if action == "start":
+        await gateway.start_identity(identity_id)
+    elif action == "stop":
+        await gateway.stop_identity(identity_id)
+    else:
+        await gateway.restart_identity(identity_id)
+    return JSONResponse({"ok": True, "action": action, "identityId": identity_id, "gateway": gateway.get_status()})
+
+
 async def api_morneven_status(request: Request):
     auth_err = require_morneven_token(request)
     if auth_err:
@@ -820,6 +1141,25 @@ async def api_morneven_workspace_changes(request: Request):
         return auth_err
 
     try:
+        state = load_morneven_runtime_state()
+        runtimes = state.get("runtimes") if isinstance(state, dict) else None
+        if isinstance(runtimes, list) and runtimes:
+            runtime_changes = []
+            for runtime in runtimes:
+                if not isinstance(runtime, dict):
+                    continue
+                runtime_dir = Path(runtime.get("workspacePath", "")).parent
+                changes = list_workspace_changes_at(runtime.get("workspacePath", ""), runtime_dir / ".morneven-runtime-manifest.json")
+                runtime_changes.append({
+                    "identityId": runtime.get("identityId"),
+                    "identity": {
+                        "id": runtime.get("identityId"),
+                        "slug": runtime.get("slug"),
+                        "name": runtime.get("name"),
+                    },
+                    **changes,
+                })
+            return JSONResponse({"ok": True, "runtimes": runtime_changes})
         return JSONResponse({"ok": True, **list_workspace_changes()})
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
@@ -830,6 +1170,34 @@ async def api_morneven_config_secrets(request: Request):
     if auth_err:
         return auth_err
 
+    state = load_morneven_runtime_state()
+    runtimes = state.get("runtimes") if isinstance(state, dict) else None
+    if isinstance(runtimes, list) and runtimes:
+        runtime_configs = []
+        for runtime in runtimes:
+            if not isinstance(runtime, dict):
+                continue
+            config_path = runtime.get("configPath")
+            data = {}
+            try:
+                if config_path:
+                    data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            runtime_configs.append({
+                "identityId": runtime.get("identityId"),
+                "identity": {
+                    "id": runtime.get("identityId"),
+                    "slug": runtime.get("slug"),
+                    "name": runtime.get("name"),
+                },
+                "providers": data.get("providers", {}) if isinstance(data, dict) else {},
+                "channels": data.get("channels", {}) if isinstance(data, dict) else {},
+                "tools": data.get("tools", {}) if isinstance(data, dict) else {},
+                "agents": data.get("agents", {}) if isinstance(data, dict) else {},
+            })
+        return JSONResponse({"ok": True, "runtimes": runtime_configs})
+
     config = load_config()
     data = config.model_dump(by_alias=True)
     return JSONResponse({
@@ -838,6 +1206,31 @@ async def api_morneven_config_secrets(request: Request):
         "channels": data.get("channels", {}),
         "tools": data.get("tools", {}),
         "agents": data.get("agents", {}),
+    })
+
+
+async def api_morneven_runtime_gateway_action(request: Request):
+    auth_err = require_morneven_token(request)
+    if auth_err:
+        return auth_err
+    identity_id = request.path_params.get("identity_id")
+    action = request.path_params.get("action")
+    if action not in {"start", "stop", "restart"}:
+        return JSONResponse({"ok": False, "error": "Invalid runtime action"}, status_code=404)
+    if action in {"start", "restart"}:
+        await sync_morneven_runtime(strict=False)
+    if action == "start":
+        await gateway.start_identity(identity_id)
+    elif action == "stop":
+        await gateway.stop_identity(identity_id)
+    else:
+        await gateway.restart_identity(identity_id)
+    return JSONResponse({
+        "ok": True,
+        "action": action,
+        "identityId": identity_id,
+        "gateway": gateway.get_status(),
+        "morneven": load_morneven_runtime_state(),
     })
 
 
@@ -900,7 +1293,7 @@ async def api_morneven_reload(request: Request):
     try:
         result = await sync_morneven_runtime(strict=True)
         if restart_gateway:
-            await gateway.restart()
+            await gateway.restart_running()
         return JSONResponse({
             "ok": True,
             "result": result,
@@ -922,10 +1315,12 @@ routes = [
     Route("/api/gateway/start", api_gateway_start, methods=["POST"]),
     Route("/api/gateway/stop", api_gateway_stop, methods=["POST"]),
     Route("/api/gateway/restart", api_gateway_restart, methods=["POST"]),
+    Route("/api/runtimes/{identity_id}/gateway/{action}", api_runtime_gateway_action, methods=["POST"]),
     Route("/api/morneven/status", api_morneven_status),
     Route("/api/morneven/gateway/start", api_morneven_gateway_start, methods=["POST"]),
     Route("/api/morneven/gateway/stop", api_morneven_gateway_stop, methods=["POST"]),
     Route("/api/morneven/gateway/restart", api_morneven_gateway_restart, methods=["POST"]),
+    Route("/api/morneven/runtimes/{identity_id}/gateway/{action}", api_morneven_runtime_gateway_action, methods=["POST"]),
     Route("/api/morneven/reload", api_morneven_reload, methods=["POST"]),
     Route("/api/morneven/workspace/changes", api_morneven_workspace_changes),
     Route("/api/morneven/config-secrets", api_morneven_config_secrets),
