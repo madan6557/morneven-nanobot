@@ -306,12 +306,32 @@ class MultiGatewayManager:
                 continue
             identity_id = str(runtime["identityId"])
             manager = self.ensure_gateway(identity_id)
+            enabled_channels = []
+            provider = "auto"
+            try:
+                config_path = runtime.get("configPath")
+                if config_path:
+                    config_data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+                    channels = config_data.get("channels", {}) if isinstance(config_data, dict) else {}
+                    if isinstance(channels, dict):
+                        enabled_channels = [
+                            name
+                            for name, channel in channels.items()
+                            if isinstance(channel, dict) and channel.get("enabled") is True
+                        ]
+                    agents = config_data.get("agents", {}) if isinstance(config_data, dict) else {}
+                    defaults = agents.get("defaults", {}) if isinstance(agents, dict) else {}
+                    provider = defaults.get("provider") or "auto"
+            except Exception:
+                enabled_channels = []
             seen.add(identity_id)
             runtimes.append({
                 **manager.get_status(),
                 "slug": runtime.get("slug"),
                 "isMain": bool(runtime.get("isMain")),
                 "workspacePath": runtime.get("workspacePath"),
+                "provider": provider,
+                "enabledChannels": enabled_channels,
             })
         for identity_id, manager in self.gateways.items():
             if identity_id not in seen:
@@ -366,6 +386,58 @@ def merge_secrets(new_data, existing_data):
                 result[k] = merge_secrets(v, existing_data.get(k, {}))
         return result
     return new_data
+
+
+def runtime_entry_for_identity(identity_id):
+    if not identity_id:
+        return None
+    state = load_morneven_runtime_state()
+    runtimes = state.get("runtimes") if isinstance(state, dict) else None
+    if not isinstance(runtimes, list):
+        return None
+    for runtime in runtimes:
+        if isinstance(runtime, dict) and str(runtime.get("identityId") or "") == str(identity_id):
+            return runtime
+    return None
+
+
+def runtime_identity_payload(runtime):
+    if not isinstance(runtime, dict):
+        return {}
+    return {
+        "id": runtime.get("identityId"),
+        "slug": runtime.get("slug"),
+        "name": runtime.get("name"),
+        "isMain": bool(runtime.get("isMain")),
+    }
+
+
+def load_runtime_config_data(identity_id):
+    runtime = runtime_entry_for_identity(identity_id)
+    if not runtime:
+        raise ValueError("Runtime identity is not available")
+    config_path = runtime.get("configPath")
+    if not config_path:
+        raise ValueError("Runtime config path is not available")
+    path = Path(config_path)
+    if not path.exists():
+        raise ValueError("Runtime config has not been materialized")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Runtime config is invalid")
+    return runtime, path, data
+
+
+def write_runtime_config_data(identity_id, body):
+    runtime, config_path, existing_data = load_runtime_config_data(identity_id)
+    merged = merge_secrets(body, existing_data)
+    validated = Config.model_validate(merged)
+    saved_data = validated.model_dump(by_alias=True)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(saved_data, indent=2), encoding="utf-8")
+    if runtime.get("isMain"):
+        save_config(validated)
+    return runtime, saved_data
 
 
 def now_iso():
@@ -439,7 +511,7 @@ def fetch_morneven_runtime_bundle():
     raise RuntimeError(f"Unable to fetch Morneven runtime bundle: {last_error}")
 
 
-def push_morneven_config_secrets(config_data):
+def push_morneven_config_secrets(config_data, identity=None):
     if not MORNEVEN_BOT_MANAGER_SYNC_TOKEN:
         return {"synced": False, "reason": "MORNEVEN_BOT_MANAGER_SYNC_TOKEN is not configured"}
     urls = backend_base_urls()
@@ -447,7 +519,8 @@ def push_morneven_config_secrets(config_data):
         return {"synced": False, "reason": "Morneven backend URL is not configured"}
 
     morneven_state = load_morneven_runtime_state()
-    identity = morneven_state.get("identity") if isinstance(morneven_state, dict) else {}
+    if identity is None:
+        identity = morneven_state.get("identity") if isinstance(morneven_state, dict) else {}
     payload = {
         "identityId": identity.get("id") if isinstance(identity, dict) else None,
         "identity": identity if isinstance(identity, dict) else {},
@@ -1030,6 +1103,57 @@ async def api_config_put(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+async def api_runtime_config_get(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    try:
+        identity_id = request.path_params.get("identity_id")
+        runtime, _, data = load_runtime_config_data(identity_id)
+        return JSONResponse({
+            "identity": runtime_identity_payload(runtime),
+            "config": mask_secrets(data),
+        })
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+
+
+async def api_runtime_config_put(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    identity_id = request.path_params.get("identity_id")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    try:
+        restart = body.pop("_restartGateway", False)
+        async with config_lock:
+            runtime, saved_data = write_runtime_config_data(identity_id, body)
+
+        morneven_sync = await asyncio.to_thread(
+            push_morneven_config_secrets,
+            saved_data,
+            runtime_identity_payload(runtime),
+        )
+        if not morneven_sync.get("synced"):
+            gateway.logs.append(f"Morneven config secret push skipped: {morneven_sync.get('reason')}")
+
+        if restart:
+            asyncio.create_task(gateway.restart_identity(identity_id))
+
+        return JSONResponse({
+            "ok": True,
+            "restarting": restart,
+            "identity": runtime_identity_payload(runtime),
+            "mornevenSync": morneven_sync,
+        })
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 async def api_status(request: Request):
     auth_err = require_auth(request)
     if auth_err:
@@ -1077,6 +1201,21 @@ async def api_logs(request: Request):
     lines = list(gateway.logs)
     for manager in gateway.gateways.values():
         lines.extend(list(manager.logs)[-200:])
+    return JSONResponse({"lines": lines[-500:]})
+
+
+async def api_runtime_logs(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    identity_id = request.path_params.get("identity_id")
+    manager = gateway.gateways.get(str(identity_id))
+    runtime = runtime_entry_for_identity(identity_id)
+    lines = []
+    if manager:
+        lines.extend(list(manager.logs)[-500:])
+    if runtime and not lines:
+        lines.append(f"[{runtime.get('name') or runtime.get('slug') or identity_id}] No runtime logs available.")
     return JSONResponse({"lines": lines[-500:]})
 
 
@@ -1310,8 +1449,11 @@ routes = [
     Route("/health", health),
     Route("/api/config", api_config_get, methods=["GET"]),
     Route("/api/config", api_config_put, methods=["PUT"]),
+    Route("/api/runtimes/{identity_id}/config", api_runtime_config_get, methods=["GET"]),
+    Route("/api/runtimes/{identity_id}/config", api_runtime_config_put, methods=["PUT"]),
     Route("/api/status", api_status),
     Route("/api/logs", api_logs),
+    Route("/api/runtimes/{identity_id}/logs", api_runtime_logs),
     Route("/api/gateway/start", api_gateway_start, methods=["POST"]),
     Route("/api/gateway/stop", api_gateway_stop, methods=["POST"]),
     Route("/api/gateway/restart", api_gateway_restart, methods=["POST"]),

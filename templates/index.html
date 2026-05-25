@@ -203,7 +203,7 @@
 
       <div class="bg-gray-900/30 border border-gray-800 rounded-xl p-6">
         <div class="flex items-center justify-between mb-4">
-          <h3 class="text-xs font-bold text-gray-600 uppercase tracking-widest">Morneven Runtimes</h3>
+          <h3 class="text-xs font-bold text-gray-600 uppercase tracking-widest">Active Personality Runtimes</h3>
           <span class="text-xs text-gray-500" x-text="runtimeList.length + ' active personality runtime(s)'"></span>
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -213,7 +213,7 @@
                 <div>
                   <div class="flex items-center gap-2">
                     <p class="font-medium" x-text="runtime.name || runtime.slug || runtime.identityId"></p>
-                    <span x-show="runtime.isMain" class="px-2 py-0.5 rounded border border-gray-700 text-[10px] text-gray-400">MAIN</span>
+                    <span class="px-2 py-0.5 rounded border border-gray-700 text-[10px] text-gray-400" x-text="runtime.isMain ? 'Main personality' : 'Sub personality'"></span>
                   </div>
                   <p class="text-xs text-gray-500 mt-1" x-text="runtime.slug || 'runtime workspace'"></p>
                 </div>
@@ -307,7 +307,18 @@
     <div x-show="tab === 'providers'" class="space-y-6 max-w-5xl">
       <div class="mb-8">
         <h2 class="text-2xl font-medium mb-1">AI Providers</h2>
-        <p class="text-gray-500 text-sm">Manage API keys and endpoints for LLM services.</p>
+        <p class="text-gray-500 text-sm">Manage API keys and model assignment for the selected active personality.</p>
+        <div x-show="runtimeList.length > 1" class="mt-4 flex flex-wrap gap-2">
+          <template x-for="runtime in runtimeList" :key="runtime.identityId || runtime.name">
+            <button type="button" @click="selectRuntime(runtime.identityId)"
+              class="px-3 py-1.5 rounded-lg border text-xs transition-colors"
+              :class="selectedRuntimeId === runtime.identityId ? 'border-emerald-500 bg-emerald-500/10 text-emerald-300' : 'border-gray-800 bg-black/30 text-gray-400 hover:border-gray-700'">
+              <span x-text="runtime.name || runtime.slug || runtime.identityId"></span>
+              <span class="ml-1 text-[10px] text-gray-500" x-text="runtime.isMain ? 'Main' : 'Sub'"></span>
+              <span class="ml-2 text-[10px] text-gray-500" x-text="runtimeChannelSummary(runtime)"></span>
+            </button>
+          </template>
+        </div>
       </div>
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -417,7 +428,18 @@
     <div x-show="tab === 'channels'" class="space-y-6 max-w-5xl">
       <div class="mb-8">
         <h2 class="text-2xl font-medium mb-1">Channels</h2>
-        <p class="text-gray-500 text-sm">Connect to messaging platforms.</p>
+        <p class="text-gray-500 text-sm">Connect messaging platforms for the selected active personality.</p>
+        <div x-show="runtimeList.length > 1" class="mt-4 flex flex-wrap gap-2">
+          <template x-for="runtime in runtimeList" :key="runtime.identityId || runtime.name">
+            <button type="button" @click="selectRuntime(runtime.identityId)"
+              class="px-3 py-1.5 rounded-lg border text-xs transition-colors"
+              :class="selectedRuntimeId === runtime.identityId ? 'border-emerald-500 bg-emerald-500/10 text-emerald-300' : 'border-gray-800 bg-black/30 text-gray-400 hover:border-gray-700'">
+              <span x-text="runtime.name || runtime.slug || runtime.identityId"></span>
+              <span class="ml-1 text-[10px] text-gray-500" x-text="runtime.isMain ? 'Main' : 'Sub'"></span>
+              <span class="ml-2 text-[10px] text-gray-500" x-text="runtimeChannelSummary(runtime)"></span>
+            </button>
+          </template>
+        </div>
       </div>
 
       <div class="space-y-4">
@@ -621,7 +643,18 @@
     <div x-show="tab === 'settings'" class="space-y-6 max-w-5xl">
       <div class="mb-8">
         <h2 class="text-2xl font-medium mb-1">Settings</h2>
-        <p class="text-gray-500 text-sm">System configuration and defaults.</p>
+        <p class="text-gray-500 text-sm">Runtime settings for the selected active personality.</p>
+        <div x-show="runtimeList.length > 1" class="mt-4 flex flex-wrap gap-2">
+          <template x-for="runtime in runtimeList" :key="runtime.identityId || runtime.name">
+            <button type="button" @click="selectRuntime(runtime.identityId)"
+              class="px-3 py-1.5 rounded-lg border text-xs transition-colors"
+              :class="selectedRuntimeId === runtime.identityId ? 'border-emerald-500 bg-emerald-500/10 text-emerald-300' : 'border-gray-800 bg-black/30 text-gray-400 hover:border-gray-700'">
+              <span x-text="runtime.name || runtime.slug || runtime.identityId"></span>
+              <span class="ml-1 text-[10px] text-gray-500" x-text="runtime.isMain ? 'Main' : 'Sub'"></span>
+              <span class="ml-2 text-[10px] text-gray-500" x-text="runtimeChannelSummary(runtime)"></span>
+            </button>
+          </template>
+        </div>
       </div>
 
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -681,10 +714,26 @@
 
     <!-- LOGS TAB -->
     <div x-show="tab === 'logs'" class="h-full flex flex-col">
-      <div class="mb-6 flex items-center justify-between">
-        <h2 class="text-2xl font-medium">System Logs</h2>
+      <div class="mb-6 flex flex-col gap-4">
+        <div class="flex items-center justify-between">
+          <div>
+            <h2 class="text-2xl font-medium">Runtime Logs</h2>
+            <p class="mt-1 text-sm text-gray-500" x-text="selectedRuntimeLabel"></p>
+          </div>
         <button @click="logs = []" class="text-xs text-blue-400 hover:text-blue-300 font-medium">Refresh /
           Clear</button>
+        </div>
+        <div x-show="runtimeList.length > 1" class="flex flex-wrap gap-2">
+          <template x-for="runtime in runtimeList" :key="runtime.identityId || runtime.name">
+            <button type="button" @click="selectRuntime(runtime.identityId)"
+              class="px-3 py-1.5 rounded-lg border text-xs transition-colors"
+              :class="selectedRuntimeId === runtime.identityId ? 'border-emerald-500 bg-emerald-500/10 text-emerald-300' : 'border-gray-800 bg-black/30 text-gray-400 hover:border-gray-700'">
+              <span x-text="runtime.name || runtime.slug || runtime.identityId"></span>
+              <span class="ml-1 text-[10px] text-gray-500" x-text="runtime.isMain ? 'Main' : 'Sub'"></span>
+              <span class="ml-2 text-[10px] text-gray-500" x-text="runtimeChannelSummary(runtime)"></span>
+            </button>
+          </template>
+        </div>
       </div>
 
       <div
@@ -716,6 +765,7 @@
         logs: [],
         saving: false,
         restartAfterSave: true,
+        selectedRuntimeId: '',
         toast: { show: false, message: '', type: 'success' },
         customModels: {},
         statusPollId: null,
@@ -805,6 +855,22 @@
         get runtimeList() {
           const runtimes = this.status?.gateway?.runtimes || this.status?.morneven?.runtimes || [];
           return Array.isArray(runtimes) ? runtimes : [];
+        },
+
+        get selectedRuntime() {
+          return this.runtimeList.find((runtime) => runtime.identityId === this.selectedRuntimeId) || this.runtimeList.find((runtime) => runtime.isMain) || this.runtimeList[0] || null;
+        },
+
+        get selectedRuntimeLabel() {
+          const runtime = this.selectedRuntime;
+          if (!runtime) return 'Global Nanobot runtime';
+          const role = runtime.isMain ? 'main personality runtime' : 'sub personality runtime';
+          return `${runtime.name || runtime.slug || runtime.identityId} - ${role}`;
+        },
+
+        runtimeChannelSummary(runtime) {
+          const channels = Array.isArray(runtime?.enabledChannels) ? runtime.enabledChannels : [];
+          return channels.length ? channels.join(', ') : 'No enabled channels';
         },
 
         get isGatewayRunning() {
@@ -999,12 +1065,15 @@
         async refreshVisibleData() {
           if (!this.isPageVisible()) return;
           await this.loadStatus();
+          this.ensureSelectedRuntime();
           if (this.tab === 'logs') await this.loadLogs();
         },
 
         async init() {
+          await this.loadStatus();
+          this.ensureSelectedRuntime();
           await this.loadConfig();
-          await this.refreshVisibleData();
+          if (this.tab === 'logs') await this.loadLogs();
           this.updatePolling();
           document.addEventListener('visibilitychange', () => {
             this.updatePolling();
@@ -1012,16 +1081,38 @@
           });
           this.$watch('tab', () => {
             this.updatePolling();
+            if (['providers', 'channels', 'settings'].includes(this.tab)) void this.loadConfig();
             void this.refreshVisibleData();
           });
         },
 
+        ensureSelectedRuntime() {
+          const runtimes = this.runtimeList;
+          if (!runtimes.length) {
+            this.selectedRuntimeId = '';
+            return;
+          }
+          if (this.selectedRuntimeId && runtimes.some((runtime) => runtime.identityId === this.selectedRuntimeId)) return;
+          const main = runtimes.find((runtime) => runtime.isMain) || runtimes[0];
+          this.selectedRuntimeId = main?.identityId || '';
+        },
+
+        async selectRuntime(identityId) {
+          if (!identityId || this.selectedRuntimeId === identityId) return;
+          this.selectedRuntimeId = identityId;
+          await this.loadConfig();
+          if (this.tab === 'logs') await this.loadLogs();
+        },
+
         async loadConfig() {
           try {
-            const res = await fetch('/api/config');
+            const endpoint = this.selectedRuntimeId
+              ? `/api/runtimes/${encodeURIComponent(this.selectedRuntimeId)}/config`
+              : '/api/config';
+            const res = await fetch(endpoint);
             if (res.ok) {
               const data = await res.json();
-              this.config = mergeDeep(defaultConfig(), data);
+              this.config = mergeDeep(defaultConfig(), data.config || data);
               this.syncCustomModelsFromConfig();
             }
           } catch (e) { }
@@ -1032,7 +1123,10 @@
           try {
             const payload = JSON.parse(JSON.stringify(this.config));
             payload._restartGateway = this.restartAfterSave;
-            const res = await fetch('/api/config', {
+            const endpoint = this.selectedRuntimeId
+              ? `/api/runtimes/${encodeURIComponent(this.selectedRuntimeId)}/config`
+              : '/api/config';
+            const res = await fetch(endpoint, {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload),
@@ -1058,13 +1152,19 @@
         async loadStatus() {
           try {
             const res = await fetch('/api/status');
-            if (res.ok) this.status = await res.json();
+            if (res.ok) {
+              this.status = await res.json();
+              this.ensureSelectedRuntime();
+            }
           } catch (e) { }
         },
 
         async loadLogs() {
           try {
-            const res = await fetch('/api/logs');
+            const endpoint = this.selectedRuntimeId
+              ? `/api/runtimes/${encodeURIComponent(this.selectedRuntimeId)}/logs`
+              : '/api/logs';
+            const res = await fetch(endpoint);
             if (res.ok) {
               const data = await res.json();
               const wasAtBottom = this.$refs.logViewer &&
