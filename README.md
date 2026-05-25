@@ -1,136 +1,134 @@
-![Nanobot](https://github.com/HKUDS/nanobot/raw/main/nanobot_logo.png)
+# Morneven Nanobot Runtime
 
-# Deploy and Host nanobot on Railway
+`morneven_nanobot` is the Morneven-managed Nanobot runtime service. It hosts the gateway process, exposes a small admin dashboard, and receives active personality bundles from Morneven Backend through Bot Manager.
 
-Nanobot is a lightweight AI gateway and orchestration layer that routes requests across multiple LLM providers and messaging channels such as Telegram. It provides a centralized dashboard to manage models, API keys, and runtime configuration, making it ideal for building scalable AI-powered backends without managing multiple integrations manually.
+The canonical Morneven documentation lives in the shared workspace `Document/` folder.
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/nanobot-4?referralCode=asepsp&utm_medium=integration&utm_source=template&utm_campaign=generic)
+## Repository Role
 
-## About Hosting nanobot
+`morneven_nanobot` is responsible for:
 
-Hosting nanobot involves deploying a containerized gateway service along with its admin dashboard. The system acts as a middleware between your applications (or chat channels) and multiple AI providers such as OpenAI, Gemini, or Groq.
+- Running the Nanobot gateway in a container.
+- Serving a Basic Auth protected dashboard.
+- Persisting runtime files under `/data/.nanobot`.
+- Pulling active Bot Manager runtime bundles from Morneven Backend.
+- Materializing active personality workspace files.
+- Starting, stopping, and restarting the gateway.
+- Reporting gateway status, logs, and Morneven runtime state.
+- Pushing safe config secret summaries back to Morneven Backend where supported.
 
-Instead of hardcoding API integrations, nanobot allows dynamic configuration via a web dashboard, with persistent storage for settings. On Railway, deployment becomes straightforward: you run a Docker container, attach a persistent volume, and configure environment variables. Railway handles networking, scaling, and uptime, while nanobot handles AI routing, logging, and orchestration.
+Morneven Backend remains the source of truth for credentials, personalities, workspace files, memory files, channels, and runtime settings.
 
-![Architecture](https://github.com/HKUDS/nanobot/raw/main/nanobot_arch.png)
+## Related Repositories
 
-## Common Use Cases
+| Repository | Relationship |
+| --- | --- |
+| `morneven-website` | Provides the Bot Manager UI used by PL7 Admin and PL7 Author |
+| `morneven-backend` | Stores Bot Manager data and sends runtime bundles to Nanobot |
+| `morneven_nanobot` | Executes the active runtime personality and gateway |
 
-* Multi-LLM Gateway (OpenAI, Gemini, Groq switching & fallback)
-* Telegram / Messaging AI Bot backend (no need to build from scratch)
-* Internal AI API Hub (centralized AI access for multiple services)
-* Experimentation layer for prompt routing and model benchmarking
+## Runtime Flow
 
-## Dependencies for nanobot Hosting
+1. Operator configures Bot Manager in Morneven Website.
+2. Website saves configuration to Morneven Backend.
+3. Backend stores credentials, active personality, workspace files, memory, profile image, channels, and settings.
+4. Operator clicks sync or runtime control in Bot Manager.
+5. Backend calls Nanobot internal Morneven endpoints.
+6. Nanobot pulls the active runtime bundle from backend using `MORNEVEN_BOT_MANAGER_SYNC_TOKEN`.
+7. Nanobot writes files into `/data/.nanobot/workspace`.
+8. Nanobot starts or restarts the gateway.
 
-* Docker (containerized deployment)
-* Railway account (for hosting and infrastructure)
-* Persistent storage (/data volume for config & logs)
+Only one active runtime personality is supported at a time.
 
-### Deployment Dependencies
+## Environment Variables
 
-* Upstream Nanobot: [https://github.com/HKUDS/nanobot](https://github.com/HKUDS/nanobot)
-* Railway Platform: [https://railway.com](https://railway.com)
-* Telegram Bot (optional): [https://core.telegram.org/bots](https://core.telegram.org/bots)
+Required for dashboard access:
 
-### Implementation Details
+```env
+ADMIN_USERNAME=<admin-user>
+ADMIN_PASSWORD=<strong-password>
+```
 
-#### Architecture Overview
+Required for Morneven integration:
 
-Nanobot runs as a single container that exposes:
+```env
+MORNEVEN_BACKEND_INTERNAL_URL=https://<backend-internal-or-public-url>
+MORNEVEN_BACKEND_PUBLIC_URL=https://<backend-public-url>
+MORNEVEN_BOT_MANAGER_SYNC_TOKEN=<same-as-backend-BOT_MANAGER_SYNC_TOKEN>
+NANOBOT_MORNEVEN_RELOAD_TOKEN=<same-as-backend-NANOBOT_MORNEVEN_RELOAD_TOKEN>
+```
 
-* Admin Dashboard (Basic Auth protected)
-* Gateway API for routing requests
-* Background worker loop (for message processing)
+Workspace:
 
-Data persistence:
+```env
+NANOBOT_AGENTS__DEFAULTS__WORKSPACE=/data/.nanobot/workspace
+```
 
-* All configuration and state stored in `/data` (must use Railway Volume)
+Railway should attach a persistent volume mounted at `/data`.
 
-#### Step 1 - Deploy on Railway
+## Deployment
 
-* Deploy this template on Railway
-* Railway builds using the `Dockerfile` (via `railway.toml`)
-* A public URL will be automatically assigned
-* Strongly recommended:
+This repo is deployed as a Docker service.
 
-  * Attach a Volume mounted to `/data` (critical for persistence)
+Required platform setup:
 
-#### Step 2 - Admin Credentials
+- Docker build enabled.
+- Public service URL for dashboard access.
+- Persistent volume mounted at `/data`.
+- Environment variables configured.
+- Backend `NANOBOT_INTERNAL_BASE_URL` points to this service, preferably using internal Railway networking.
 
-Set environment variables:
+Railway uses `railway.toml` and starts:
 
-* `ADMIN_USERNAME` -> dashboard login username
-* `ADMIN_PASSWORD` -> dashboard login password
+```bash
+/app/start.sh
+```
 
-Notes:
-* For production: ALWAYS set explicitly
+## Endpoints
 
-#### Step 3 - Configure LLM Providers
+Public dashboard and Nanobot endpoints:
 
-1. Open your Railway public URL
-2. Login using Basic Auth
-3. Go to **AI Providers tab**
-4. Add API Keys:
+```text
+GET  /
+GET  /health
+GET  /api/config
+PUT  /api/config
+GET  /api/status
+GET  /api/logs
+POST /api/gateway/start
+POST /api/gateway/stop
+POST /api/gateway/restart
+```
 
-   * OpenAI
-   * Groq
-   * Gemini
-5. Select models (or custom model ID)
-6. Set default provider (toggle)
-7. Save configuration (stored in `/data`)
+Morneven protected endpoints:
 
-    ![AI Providers tab](./img/ai_providers.png)
+```text
+GET  /api/morneven/status
+GET  /api/morneven/workspace/changes
+GET  /api/morneven/config-secrets
+POST /api/morneven/gateway/start
+POST /api/morneven/gateway/stop
+POST /api/morneven/gateway/restart
+POST /api/morneven/reload
+```
 
-#### Step 4 - Configure Messaging Channels (Telegram Example)
+Protected endpoints require `x-morneven-reload-token` matching `NANOBOT_MORNEVEN_RELOAD_TOKEN`.
 
-1. Go to **Channels tab**
-2. Enable Telegram
-3. Paste bot token from BotFather
-4. Set allowed users:
+## Operational Notes
 
-   * `*` -> allow all users
-   * or specific user IDs (comma-separated)
+- Do not edit runtime workspace files directly unless intentionally testing sync conflict behavior.
+- Bot Manager sync will replace files owned by the active personality bundle.
+- Gateway start and restart pull current Morneven runtime data before launching when integration is configured.
+- If backend sync tokens differ, reload and runtime bundle fetch will fail.
+- If `/data` is not persistent, runtime state is lost on redeploy.
 
-    ![Channels tab](./img/channels.png)
+## Documentation
 
-You can also configure:
+Active shared documentation:
 
-* WhatsApp bridge
-* Feishu / other integrations
-
-#### Step 5 - Run and Test Gateway
-
-* Go to **Overview / Settings**
-* Start or restart the gateway
-* Check logs for errors
-* Send test message to your bot
-
-    ![Overview tab](./img/overview.png)
-
-If no response:
-
-* Check API keys
-* Check provider selection
-* Check logs
-
-  ![Logs](./img/logs.png)
-
-#### Key Endpoints
-
-* `GET /` -> Admin dashboard (Basic Auth)
-* `GET /health` -> Healthcheck (Railway)
-* `GET /api/config` -> Read config (masked)
-* `PUT /api/config` -> Save config
-* `GET /api/status` -> Gateway status
-* `GET /api/logs` -> Logs
-* `POST /api/gateway/start` -> Start gateway
-* `POST /api/gateway/stop` -> Stop gateway
-* `POST /api/gateway/restart` -> Restart gateway
-* `POST /api/morneven/reload` -> Pull active Morneven personality and restart gateway
-
-## Why Deploy nanobot on Railway?
-
-Railway is a singular platform to deploy your infrastructure stack. Railway will host your infrastructure so you don't have to deal with configuration, while allowing you to vertically and horizontally scale it.
-
-By deploying nanobot on Railway, you are one step closer to supporting a complete full-stack application with minimal burden. Host your servers, databases, AI agents, and more on Railway.
+- [Platform Architecture](../Document/Documentation/General/2026-05-25-platform-architecture-v01.md)
+- [Bot Manager Alpha Integration Plan](../Document/Documentation/General/2026-05-21-bot-manager-alpha-integration-plan-v01.md)
+- [Bot Manager Alpha User Guide](../Document/Guide/General/2026-05-21-bot-manager-alpha-user-guide-v01.md)
+- [Bot Manager Alpha Deployment Guide](../Document/Guide/General/2026-05-21-bot-manager-alpha-deployment-guide-v01.md)
+- [Backend API Contract](../Document/Documentation/Backend/root-docs/2026-05-25-backend-api-contract-v01.md)
+- [Document Index](../Document/Documentation/General/2026-05-25-document-index-v01.md)
