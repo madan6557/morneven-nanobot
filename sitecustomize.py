@@ -147,7 +147,7 @@ def _patch_message_tool_thread_id() -> None:
     try:
         from nanobot.agent.tools.base import tool_parameters
         from nanobot.agent.tools.message import MessageTool
-        from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
+        from nanobot.agent.tools.schema import ArraySchema, ObjectSchema, StringSchema, tool_parameters_schema
         from nanobot.bus.events import OutboundMessage
     except Exception:
         return
@@ -174,6 +174,18 @@ def _patch_message_tool_thread_id() -> None:
                 "Optional Telegram forum topic ID. Use with channel='telegram' and a group "
                 "chat_id to send into that topic instead of the main group."
             ),
+            metadata=ObjectSchema(
+                {
+                    "message_thread_id": StringSchema("Telegram forum topic ID."),
+                    "thread_id": StringSchema("Alias for message_thread_id."),
+                    "topic_id": StringSchema("Alias for message_thread_id."),
+                },
+                description=(
+                    "Optional channel metadata. For Telegram topics, prefer the top-level "
+                    "message_thread_id parameter. metadata.message_thread_id is accepted for "
+                    "compatibility."
+                ),
+            ),
             media=ArraySchema(
                 StringSchema(""),
                 description=(
@@ -198,6 +210,7 @@ def _patch_message_tool_thread_id() -> None:
         message_thread_id: str | int | None = None,
         media: list[str] | None = None,
         buttons: list[list[str]] | None = None,
+        metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str:
         from nanobot.utils.helpers import strip_think
@@ -211,10 +224,27 @@ def _patch_message_tool_thread_id() -> None:
             ):
                 return "Error: buttons must be a list of list of strings"
 
+        incoming_metadata = metadata if metadata is not None else kwargs.get("metadata")
+        if incoming_metadata is not None and not isinstance(incoming_metadata, dict):
+            return "Error: metadata must be an object"
+        incoming_metadata = incoming_metadata or {}
+
         explicit_thread_id = (
             message_thread_id
             if message_thread_id is not None
-            else kwargs.get("thread_id", kwargs.get("topic_id"))
+            else kwargs.get(
+                "message_thread_id",
+                kwargs.get(
+                    "thread_id",
+                    kwargs.get(
+                        "topic_id",
+                        incoming_metadata.get(
+                            "message_thread_id",
+                            incoming_metadata.get("thread_id", incoming_metadata.get("topic_id")),
+                        ),
+                    ),
+                ),
+            )
         )
         try:
             telegram_thread_id = _coerce_message_thread_id(explicit_thread_id)
@@ -255,13 +285,13 @@ def _patch_message_tool_thread_id() -> None:
             except (OSError, PermissionError, ValueError) as exc:
                 return f"Error: media path is not allowed: {str(exc)}"
 
-        metadata = dict(self._default_metadata.get()) if same_target else {}
+        outbound_metadata = dict(self._default_metadata.get()) if same_target else {}
         if message_id:
-            metadata["message_id"] = message_id
+            outbound_metadata["message_id"] = message_id
         if telegram_thread_id is not None:
-            metadata["message_thread_id"] = telegram_thread_id
+            outbound_metadata["message_thread_id"] = telegram_thread_id
         if self._record_channel_delivery_var.get() or media:
-            metadata["_record_channel_delivery"] = True
+            outbound_metadata["_record_channel_delivery"] = True
 
         msg = OutboundMessage(
             channel=channel,
@@ -269,7 +299,7 @@ def _patch_message_tool_thread_id() -> None:
             content=content,
             media=media or [],
             buttons=buttons or [],
-            metadata=metadata,
+            metadata=outbound_metadata,
         )
 
         try:
