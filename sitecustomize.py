@@ -9,6 +9,8 @@ from typing import Any
 
 COMMAND_TARGET_RE = re.compile(r"^/[A-Za-z0-9_-]+@([A-Za-z0-9_]+)(?=$|\s)")
 LEADING_MENTION_RE = re.compile(r"^@([A-Za-z0-9_]+)(?=$|\s)")
+COMMAND_TARGETS_RE = re.compile(r"(?:^|\s)/[A-Za-z0-9_-]+@([A-Za-z0-9_]+)(?=$|\s)")
+MENTIONS_RE = re.compile(r"@([A-Za-z0-9_]+)(?=$|\s|[.,!?;:])")
 
 
 def _normalize_username(value: Any) -> str:
@@ -20,6 +22,20 @@ def _normalize_username(value: Any) -> str:
 def _message_text(message: Any) -> str:
     text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
     return str(text).strip()
+
+
+def _message_usernames(pattern: re.Pattern[str], text: str) -> set[str]:
+    return {_normalize_username(match) for match in pattern.findall(text) if _normalize_username(match)}
+
+
+def _message_mentions_bot(username: str, text: str) -> bool:
+    if not username:
+        return False
+    command_targets = _message_usernames(COMMAND_TARGETS_RE, text)
+    if username in command_targets:
+        return True
+    mentions = _message_usernames(MENTIONS_RE, text)
+    return username in mentions
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -55,6 +71,13 @@ async def _targeted_at_other_bot(channel: Any, message: Any) -> bool:
     if not username:
         return False
 
+    if _message_mentions_bot(username, text):
+        return False
+
+    command_targets = _message_usernames(COMMAND_TARGETS_RE, text)
+    if command_targets:
+        return True
+
     command_match = COMMAND_TARGET_RE.match(text)
     if command_match:
         return _normalize_username(command_match.group(1)) != username
@@ -86,6 +109,23 @@ def _patch_telegram_channel() -> None:
         from nanobot.channels.telegram import TelegramChannel
     except Exception:
         return
+
+    original_group_checker = getattr(TelegramChannel, "_is_group_message_for_bot", None)
+    if original_group_checker and not getattr(original_group_checker, "_morneven_multi_mention_filter", False):
+
+        async def _is_group_message_for_bot(self: Any, message: Any) -> bool:
+            text = _message_text(message)
+            username = await _bot_username(self)
+            if username and _message_mentions_bot(username, text):
+                return True
+            command_targets = _message_usernames(COMMAND_TARGETS_RE, text)
+            mentions = _message_usernames(MENTIONS_RE, text)
+            if username and (command_targets or mentions):
+                return False
+            return bool(await _maybe_await(original_group_checker(self, message)))
+
+        _is_group_message_for_bot._morneven_multi_mention_filter = True  # type: ignore[attr-defined]
+        TelegramChannel._is_group_message_for_bot = _is_group_message_for_bot
 
     original_forward_command = getattr(TelegramChannel, "_forward_command", None)
     if original_forward_command and not getattr(original_forward_command, "_morneven_target_filter", False):
