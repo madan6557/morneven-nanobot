@@ -392,5 +392,38 @@ def _patch_telegram_channel() -> None:
         TelegramChannel._on_message = _on_message
 
 
+def _auto_dream_enabled() -> bool:
+    value = os.environ.get("MORNEVEN_AUTO_DREAM_ENABLED", "").strip().lower()
+    return value not in {"0", "false", "off", "no"}
+
+
+def _patch_cron_auto_dream() -> None:
+    try:
+        from nanobot.cron.service import CronService
+    except Exception:
+        return
+
+    original_register = getattr(CronService, "register_system_job", None)
+    if not original_register or getattr(original_register, "_morneven_auto_dream_patch", False):
+        return
+
+    def register_system_job(self: Any, job: Any) -> Any:
+        if getattr(job, "name", "") == "dream" and not _auto_dream_enabled():
+            store = self._load_store()
+            if store is not None:
+                store.jobs = [
+                    item
+                    for item in store.jobs
+                    if getattr(item, "id", "") != getattr(job, "id", "") and getattr(item, "name", "") != "dream"
+                ]
+                self._save_store()
+            return job
+        return original_register(self, job)
+
+    register_system_job._morneven_auto_dream_patch = True  # type: ignore[attr-defined]
+    CronService.register_system_job = register_system_job
+
+
 _patch_message_tool_thread_id()
 _patch_telegram_channel()
+_patch_cron_auto_dream()

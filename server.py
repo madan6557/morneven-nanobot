@@ -133,6 +133,7 @@ class GatewayManager:
         gateway_port=None,
         telegram_bot_username=None,
         telegram_active_bot_usernames=None,
+        auto_dream_enabled=None,
     ):
         self.identity_id = identity_id
         self.name = name
@@ -146,6 +147,7 @@ class GatewayManager:
             for username in (telegram_active_bot_usernames or [])
             if str(username or "").strip()
         ]
+        self.auto_dream_enabled = auto_dream_enabled
         self.process: asyncio.subprocess.Process | None = None
         self.state = "stopped"
         self.logs: deque[str] = deque(maxlen=500)
@@ -183,6 +185,8 @@ class GatewayManager:
                 env["MORNEVEN_TELEGRAM_BOT_USERNAME"] = self.telegram_bot_username
             if self.telegram_active_bot_usernames:
                 env["MORNEVEN_TELEGRAM_ACTIVE_BOTS"] = ",".join(self.telegram_active_bot_usernames)
+            if self.auto_dream_enabled is not None:
+                env["MORNEVEN_AUTO_DREAM_ENABLED"] = "1" if self.auto_dream_enabled else "0"
             self.process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
@@ -313,6 +317,7 @@ class MultiGatewayManager:
             gateway_port = runtime.get("gatewayPort")
             telegram_bot_username = runtime.get("telegramBotUsername")
             telegram_active_bot_usernames = runtime.get("telegramActiveBotUsernames")
+            auto_dream_enabled = runtime.get("autoDreamEnabled")
         else:
             runtime_id = str(identity_id or "main")
             name = "Main"
@@ -322,6 +327,7 @@ class MultiGatewayManager:
             gateway_port = None
             telegram_bot_username = None
             telegram_active_bot_usernames = None
+            auto_dream_enabled = None
         manager = self.gateways.get(runtime_id)
         if not manager:
             manager = GatewayManager(
@@ -333,6 +339,7 @@ class MultiGatewayManager:
                 gateway_port,
                 telegram_bot_username,
                 telegram_active_bot_usernames,
+                auto_dream_enabled,
             )
             self.gateways[runtime_id] = manager
         else:
@@ -347,6 +354,7 @@ class MultiGatewayManager:
                 for username in (telegram_active_bot_usernames or [])
                 if str(username or "").strip()
             ]
+            manager.auto_dream_enabled = auto_dream_enabled
         return manager
 
     def main_gateway(self):
@@ -1052,6 +1060,18 @@ def runtime_entries_from_bundle(bundle):
     }]
 
 
+def runtime_auto_dream_enabled(settings):
+    if not isinstance(settings, dict):
+        return None
+    auto_dream = settings.get("autoDream")
+    if not isinstance(auto_dream, dict) or "enabled" not in auto_dream:
+        return None
+    value = auto_dream.get("enabled")
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "off", "no"}
+    return bool(value)
+
+
 def materialize_runtime_entry(
     entry,
     general_config,
@@ -1130,6 +1150,7 @@ def materialize_runtime_entry(
             for username in (telegram_active_bot_usernames or [])
             if normalize_bot_username(username)
         ],
+        "autoDreamEnabled": runtime_auto_dream_enabled(entry.get("settings")),
         "fileCount": len(written),
         "files": [item["path"] for item in written],
         "syncedAt": now_iso(),
