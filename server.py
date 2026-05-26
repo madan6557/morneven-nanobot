@@ -123,13 +123,29 @@ def require_morneven_token(request: Request):
 
 
 class GatewayManager:
-    def __init__(self, identity_id="main", name="Main", config_path=None, runtime_path=None, workspace_path=None, gateway_port=None):
+    def __init__(
+        self,
+        identity_id="main",
+        name="Main",
+        config_path=None,
+        runtime_path=None,
+        workspace_path=None,
+        gateway_port=None,
+        telegram_bot_username=None,
+        telegram_active_bot_usernames=None,
+    ):
         self.identity_id = identity_id
         self.name = name
         self.config_path = Path(config_path).expanduser() if config_path else None
         self.runtime_path = Path(runtime_path).expanduser() if runtime_path else None
         self.workspace_path = Path(workspace_path).expanduser() if workspace_path else None
         self.gateway_port = int(gateway_port) if gateway_port else None
+        self.telegram_bot_username = str(telegram_bot_username or "").strip().lstrip("@")
+        self.telegram_active_bot_usernames = [
+            str(username).strip().lstrip("@")
+            for username in (telegram_active_bot_usernames or [])
+            if str(username or "").strip()
+        ]
         self.process: asyncio.subprocess.Process | None = None
         self.state = "stopped"
         self.logs: deque[str] = deque(maxlen=500)
@@ -163,6 +179,10 @@ class GatewayManager:
             if self.workspace_path:
                 self.workspace_path.mkdir(parents=True, exist_ok=True)
                 env["NANOBOT_AGENTS__DEFAULTS__WORKSPACE"] = str(self.workspace_path)
+            if self.telegram_bot_username:
+                env["MORNEVEN_TELEGRAM_BOT_USERNAME"] = self.telegram_bot_username
+            if self.telegram_active_bot_usernames:
+                env["MORNEVEN_TELEGRAM_ACTIVE_BOTS"] = ",".join(self.telegram_active_bot_usernames)
             self.process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
@@ -237,6 +257,7 @@ class GatewayManager:
             "startedAt": started_at,
             "restart_count": self.restart_count,
             "gatewayPort": self.gateway_port,
+            "telegramBotUsername": self.telegram_bot_username or None,
             "lastError": self.last_error,
             "lastExitCode": self.last_exit_code,
             "lastLogLine": self.logs[-1] if self.logs else None,
@@ -290,6 +311,8 @@ class MultiGatewayManager:
             runtime_path = runtime.get("runtimePath")
             workspace_path = runtime.get("workspacePath")
             gateway_port = runtime.get("gatewayPort")
+            telegram_bot_username = runtime.get("telegramBotUsername")
+            telegram_active_bot_usernames = runtime.get("telegramActiveBotUsernames")
         else:
             runtime_id = str(identity_id or "main")
             name = "Main"
@@ -297,9 +320,20 @@ class MultiGatewayManager:
             runtime_path = None
             workspace_path = None
             gateway_port = None
+            telegram_bot_username = None
+            telegram_active_bot_usernames = None
         manager = self.gateways.get(runtime_id)
         if not manager:
-            manager = GatewayManager(runtime_id, name, config_path, runtime_path, workspace_path, gateway_port)
+            manager = GatewayManager(
+                runtime_id,
+                name,
+                config_path,
+                runtime_path,
+                workspace_path,
+                gateway_port,
+                telegram_bot_username,
+                telegram_active_bot_usernames,
+            )
             self.gateways[runtime_id] = manager
         else:
             manager.name = name
@@ -307,6 +341,12 @@ class MultiGatewayManager:
             manager.runtime_path = Path(runtime_path).expanduser() if runtime_path else None
             manager.workspace_path = Path(workspace_path).expanduser() if workspace_path else None
             manager.gateway_port = int(gateway_port) if gateway_port else None
+            manager.telegram_bot_username = str(telegram_bot_username or "").strip().lstrip("@")
+            manager.telegram_active_bot_usernames = [
+                str(username).strip().lstrip("@")
+                for username in (telegram_active_bot_usernames or [])
+                if str(username or "").strip()
+            ]
         return manager
 
     def main_gateway(self):
@@ -863,6 +903,64 @@ def merge_deep(target, source):
     return result
 
 
+TELEGRAM_USERNAME_CACHE: dict[str, str] = {}
+
+
+def normalize_bot_username(value):
+    return str(value or "").strip().lstrip("@")
+
+
+def telegram_token_from_entry(entry):
+    channels = entry.get("channels") if isinstance(entry, dict) else None
+    if not isinstance(channels, dict):
+        return ""
+    telegram = channels.get("telegram")
+    if not isinstance(telegram, dict) or telegram.get("enabled") is not True:
+        return ""
+    token = telegram.get("token")
+    return str(token).strip() if token else ""
+
+
+def telegram_username_for_token(token):
+    token = str(token or "").strip()
+    if not token:
+        return ""
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    if token_hash in TELEGRAM_USERNAME_CACHE:
+        return TELEGRAM_USERNAME_CACHE[token_hash]
+    try:
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{urllib.parse.quote(token, safe=':')}/getMe",
+            headers={"accept": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        result = payload.get("result") if isinstance(payload, dict) else None
+        username = normalize_bot_username(result.get("username") if isinstance(result, dict) else "")
+        if username:
+            TELEGRAM_USERNAME_CACHE[token_hash] = username
+            return username
+    except Exception:
+        return ""
+    return ""
+
+
+def telegram_usernames_for_entries(entries):
+    usernames_by_identity = {}
+    active_usernames = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else {}
+        identity_id = str(identity.get("id") or "")
+        username = telegram_username_for_token(telegram_token_from_entry(entry))
+        if username:
+            if identity_id:
+                usernames_by_identity[identity_id] = username
+            active_usernames.append(username)
+    return usernames_by_identity, active_usernames
+
+
 def apply_bundle_to_config(bundle, workspace_path=WORKSPACE_PATH, config_path=None, persist_default=True, gateway_port=None):
     config = load_config()
     data = config.model_dump(by_alias=True)
@@ -954,7 +1052,16 @@ def runtime_entries_from_bundle(bundle):
     }]
 
 
-def materialize_runtime_entry(entry, general_config, mode, main_identity_id, gateway_port, persist_default=False):
+def materialize_runtime_entry(
+    entry,
+    general_config,
+    mode,
+    main_identity_id,
+    gateway_port,
+    telegram_bot_username="",
+    telegram_active_bot_usernames=None,
+    persist_default=False,
+):
     identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else {}
     runtime_dir = runtime_dir_for_identity(identity)
     workspace_path = runtime_dir / "workspace"
@@ -1017,6 +1124,12 @@ def materialize_runtime_entry(entry, general_config, mode, main_identity_id, gat
         "workspacePath": str(workspace_path),
         "configPath": str(config_path),
         "gatewayPort": gateway_port,
+        "telegramBotUsername": normalize_bot_username(telegram_bot_username) or None,
+        "telegramActiveBotUsernames": [
+            normalize_bot_username(username)
+            for username in (telegram_active_bot_usernames or [])
+            if normalize_bot_username(username)
+        ],
         "fileCount": len(written),
         "files": [item["path"] for item in written],
         "syncedAt": now_iso(),
@@ -1040,9 +1153,11 @@ def materialize_morneven_runtime(bundle):
     main_identity = bundle.get("mainIdentity") if isinstance(bundle.get("mainIdentity"), dict) else bundle.get("activeIdentity", {})
     main_identity_id = str(main_identity.get("id") or entries[0]["identity"].get("id"))
     general_config = bundle.get("generalConfig") if isinstance(bundle.get("generalConfig"), dict) else {}
+    telegram_usernames_by_identity, telegram_active_usernames = telegram_usernames_for_entries(entries)
     runtimes = []
     for index, entry in enumerate(entries):
         identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else {}
+        identity_id = str(identity.get("id") or "")
         persist_default = str(identity.get("id")) == main_identity_id
         runtimes.append(materialize_runtime_entry(
             entry,
@@ -1050,6 +1165,8 @@ def materialize_morneven_runtime(bundle):
             bundle.get("mode", "single-active-personality"),
             main_identity_id,
             GATEWAY_BASE_PORT + index,
+            telegram_usernames_by_identity.get(identity_id, ""),
+            telegram_active_usernames,
             persist_default=persist_default,
         ))
 

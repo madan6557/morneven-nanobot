@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import re
 from typing import Any
 
@@ -17,6 +18,15 @@ def _normalize_username(value: Any) -> str:
     if not value:
         return ""
     return str(value).strip().lstrip("@").lower()
+
+
+def _env_username(name: str) -> str:
+    return _normalize_username(os.environ.get(name, ""))
+
+
+def _env_usernames(name: str) -> set[str]:
+    raw = os.environ.get(name, "")
+    return {_normalize_username(item) for item in raw.split(",") if _normalize_username(item)}
 
 
 def _message_text(message: Any) -> str:
@@ -45,6 +55,10 @@ async def _maybe_await(value: Any) -> Any:
 
 
 async def _bot_username(channel: Any) -> str:
+    env_username = _env_username("MORNEVEN_TELEGRAM_BOT_USERNAME")
+    if env_username:
+        return env_username
+
     cached = _normalize_username(getattr(channel, "_bot_username", None))
     if cached:
         return cached
@@ -62,6 +76,14 @@ async def _bot_username(channel: Any) -> str:
     return ""
 
 
+def _registered_bot_mentions(text: str) -> set[str]:
+    registered = _env_usernames("MORNEVEN_TELEGRAM_ACTIVE_BOTS")
+    if not registered:
+        return set()
+    message_targets = _message_usernames(COMMAND_TARGETS_RE, text) | _message_usernames(MENTIONS_RE, text)
+    return message_targets & registered
+
+
 async def _targeted_at_other_bot(channel: Any, message: Any) -> bool:
     text = _message_text(message)
     if not text:
@@ -75,6 +97,10 @@ async def _targeted_at_other_bot(channel: Any, message: Any) -> bool:
         return False
 
     command_targets = _message_usernames(COMMAND_TARGETS_RE, text)
+    registered_mentions = _registered_bot_mentions(text)
+    if registered_mentions:
+        return True
+
     if command_targets:
         return True
 
@@ -120,6 +146,9 @@ def _patch_telegram_channel() -> None:
                 return True
             command_targets = _message_usernames(COMMAND_TARGETS_RE, text)
             mentions = _message_usernames(MENTIONS_RE, text)
+            registered_mentions = _registered_bot_mentions(text)
+            if username and registered_mentions:
+                return False
             if username and (command_targets or mentions):
                 return False
             return bool(await _maybe_await(original_group_checker(self, message)))
