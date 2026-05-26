@@ -1,6 +1,6 @@
 # Morneven Nanobot Runtime
 
-`morneven_nanobot` is the Morneven-managed Nanobot runtime service. It hosts the gateway process, exposes a small admin dashboard, and receives active personality bundles from Morneven Backend through Bot Manager.
+`morneven_nanobot` is the Morneven-managed Nanobot runtime service. It hosts gateway processes, exposes a small admin dashboard, and receives active personality bundles from Morneven Backend through Bot Manager.
 
 The canonical Morneven documentation lives in the shared workspace `Document/` folder.
 
@@ -8,12 +8,12 @@ The canonical Morneven documentation lives in the shared workspace `Document/` f
 
 `morneven_nanobot` is responsible for:
 
-- Running the Nanobot gateway in a container.
+- Running Nanobot gateways in a container.
 - Serving a Basic Auth protected dashboard.
 - Persisting runtime files under `/data/.nanobot`.
 - Pulling active Bot Manager runtime bundles from Morneven Backend.
 - Materializing active personality workspace files.
-- Starting, stopping, and restarting the gateway.
+- Starting, stopping, and restarting runtime gateways.
 - Reporting gateway status, logs, and Morneven runtime state.
 - Pushing safe config secret summaries back to Morneven Backend where supported.
 
@@ -25,20 +25,20 @@ Morneven Backend remains the source of truth for credentials, personalities, wor
 | --- | --- |
 | `morneven-website` | Provides the Bot Manager UI used by PL7 Admin and PL7 Author |
 | `morneven-backend` | Stores Bot Manager data and sends runtime bundles to Nanobot |
-| `morneven_nanobot` | Executes the active runtime personality and gateway |
+| `morneven_nanobot` | Executes active runtime personalities and gateways |
 
 ## Runtime Flow
 
 1. Operator configures Bot Manager in Morneven Website.
 2. Website saves configuration to Morneven Backend.
-3. Backend stores credentials, active personality, workspace files, memory, profile image, channels, and settings.
+3. Backend stores credentials, active personalities, workspace files, memory, profile images, channels, and settings.
 4. Operator clicks sync or runtime control in Bot Manager.
 5. Backend calls Nanobot internal Morneven endpoints.
 6. Nanobot pulls the active runtime bundle from backend using `MORNEVEN_BOT_MANAGER_SYNC_TOKEN`.
 7. Nanobot writes files into `/data/.nanobot/workspace`.
-8. Nanobot starts or restarts the gateway.
+8. Nanobot starts or restarts the relevant gateway.
 
-Only one active runtime personality is supported at a time.
+Runtime mode is controlled by Bot Manager. `single-active-personality` runs the main personality. `multi-active-personality` can run multiple active identities while preserving one main identity.
 
 ## Environment Variables
 
@@ -98,6 +98,10 @@ GET  /api/logs
 POST /api/gateway/start
 POST /api/gateway/stop
 POST /api/gateway/restart
+GET  /api/runtimes/{identity_id}/config
+PUT  /api/runtimes/{identity_id}/config
+GET  /api/runtimes/{identity_id}/logs
+POST /api/runtimes/{identity_id}/gateway/{action}
 ```
 
 Morneven protected endpoints:
@@ -109,6 +113,7 @@ GET  /api/morneven/config-secrets
 POST /api/morneven/gateway/start
 POST /api/morneven/gateway/stop
 POST /api/morneven/gateway/restart
+POST /api/morneven/runtimes/{identity_id}/gateway/{action}
 POST /api/morneven/reload
 ```
 
@@ -117,18 +122,18 @@ Protected endpoints require `x-morneven-reload-token` matching `NANOBOT_MORNEVEN
 ## Operational Notes
 
 - Do not edit runtime workspace files directly unless intentionally testing sync conflict behavior.
-- Bot Manager sync will replace files owned by the active personality bundle.
+- Bot Manager sync will replace files owned by active personality bundles.
 - Gateway start and restart pull current Morneven runtime data before launching when integration is configured.
 - If backend sync tokens differ, reload and runtime bundle fetch will fail.
 - If `/data` is not persistent, runtime state is lost on redeploy.
+- Telegram forum topic sends accept numeric `message_thread_id`, `thread_id`, or `topic_id` metadata.
 
 ## Documentation
 
 Active shared documentation:
 
 - [Platform Architecture](../Document/Documentation/General/2026-05-25-platform-architecture-v01.md)
-- [Bot Manager Alpha Integration Plan](../Document/Documentation/General/2026-05-21-bot-manager-alpha-integration-plan-v01.md)
-- [Bot Manager Alpha User Guide](../Document/Guide/General/2026-05-21-bot-manager-alpha-user-guide-v01.md)
+- [Bot Manager Guide](../Document/Guide/General/2026-05-27-bot-manager-guide-v01.md)
 - [Bot Manager Alpha Deployment Guide](../Document/Guide/General/2026-05-21-bot-manager-alpha-deployment-guide-v01.md)
 - [Backend API Contract](../Document/Documentation/Backend/root-docs/2026-05-25-backend-api-contract-v01.md)
-- [Document Index](../Document/Documentation/General/2026-05-25-document-index-v01.md)
+- [Document Index](../Document/Documentation/General/2026-05-27-document-index-v02.md)
