@@ -54,6 +54,19 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _coerce_message_thread_id(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("message_thread_id must be a numeric Telegram topic ID")
+    text = str(value).strip()
+    if not text:
+        return None
+    if not re.fullmatch(r"-?\d+", text):
+        raise ValueError("message_thread_id must be a numeric Telegram topic ID")
+    return int(text)
+
+
 async def _bot_username(channel: Any) -> str:
     env_username = _env_username("MORNEVEN_TELEGRAM_BOT_USERNAME")
     if env_username:
@@ -130,6 +143,154 @@ async def _command_allowed_for_group(channel: Any, message: Any) -> bool:
     return True
 
 
+def _patch_message_tool_thread_id() -> None:
+    try:
+        from nanobot.agent.tools.base import tool_parameters
+        from nanobot.agent.tools.message import MessageTool
+        from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
+        from nanobot.bus.events import OutboundMessage
+    except Exception:
+        return
+
+    if getattr(MessageTool, "_morneven_thread_message_patch", False):
+        return
+
+    tool_parameters(
+        tool_parameters_schema(
+            content=StringSchema(
+                "Message content for proactive or cross-channel delivery. "
+                "Do not use this for a normal reply in the current chat."
+            ),
+            channel=StringSchema(
+                "Optional target channel for cross-channel/proactive delivery. "
+                "Do not set this to the current runtime channel for a normal reply."
+            ),
+            chat_id=StringSchema(
+                "Optional target chat/user ID for cross-channel/proactive delivery. "
+                "On WebSocket/WebUI turns: omit chat_id to use the server conversation id. "
+                "Do not set this to the current runtime chat for a normal reply."
+            ),
+            message_thread_id=StringSchema(
+                "Optional Telegram forum topic ID. Use with channel='telegram' and a group "
+                "chat_id to send into that topic instead of the main group."
+            ),
+            media=ArraySchema(
+                StringSchema(""),
+                description=(
+                    "Optional list of existing file paths to attach for proactive or "
+                    "cross-channel delivery."
+                ),
+            ),
+            buttons=ArraySchema(
+                ArraySchema(StringSchema("Button label")),
+                description="Optional inline keyboard buttons as list of rows.",
+            ),
+            required=["content"],
+        )
+    )(MessageTool)
+
+    async def _execute(
+        self: Any,
+        content: str,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        message_id: str | None = None,
+        message_thread_id: str | int | None = None,
+        media: list[str] | None = None,
+        buttons: list[list[str]] | None = None,
+        **kwargs: Any,
+    ) -> str:
+        from nanobot.utils.helpers import strip_think
+
+        content = strip_think(content)
+
+        if buttons is not None:
+            if not isinstance(buttons, list) or any(
+                not isinstance(row, list) or any(not isinstance(label, str) for label in row)
+                for row in buttons
+            ):
+                return "Error: buttons must be a list of list of strings"
+
+        explicit_thread_id = (
+            message_thread_id
+            if message_thread_id is not None
+            else kwargs.get("thread_id", kwargs.get("topic_id"))
+        )
+        try:
+            telegram_thread_id = _coerce_message_thread_id(explicit_thread_id)
+        except ValueError as exc:
+            return f"Error: {str(exc)}"
+
+        default_channel = self._default_channel.get()
+        default_chat_id = self._default_chat_id.get()
+        channel = channel or default_channel
+        explicit_chat_id = chat_id
+        if (
+            default_channel == "websocket"
+            and channel == "websocket"
+            and explicit_chat_id is not None
+            and str(explicit_chat_id).strip() != ""
+            and str(explicit_chat_id).strip() != str(default_chat_id).strip()
+        ):
+            return (
+                "Error: chat_id does not match the active WebSocket conversation. "
+                "Omit chat_id and usually channel so delivery uses the current conversation id."
+            )
+        chat_id = chat_id or default_chat_id
+        same_target = channel == default_channel and chat_id == default_chat_id
+        if same_target:
+            message_id = message_id or self._default_message_id.get()
+        else:
+            message_id = None
+
+        if not channel or not chat_id:
+            return "Error: No target channel/chat specified"
+
+        if not self._send_callback:
+            return "Error: Message sending not configured"
+
+        if media:
+            try:
+                media = self._resolve_media(media)
+            except (OSError, PermissionError, ValueError) as exc:
+                return f"Error: media path is not allowed: {str(exc)}"
+
+        metadata = dict(self._default_metadata.get()) if same_target else {}
+        if message_id:
+            metadata["message_id"] = message_id
+        if telegram_thread_id is not None:
+            metadata["message_thread_id"] = telegram_thread_id
+        if self._record_channel_delivery_var.get() or media:
+            metadata["_record_channel_delivery"] = True
+
+        msg = OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=content,
+            media=media or [],
+            buttons=buttons or [],
+            metadata=metadata,
+        )
+
+        try:
+            await self._send_callback(msg)
+            if channel == default_channel and chat_id == default_chat_id:
+                self._sent_in_turn = True
+                if media:
+                    prev = self._turn_delivered_media_var.get()
+                    self._turn_delivered_media_var.set(prev + tuple(str(path) for path in media))
+            media_info = f" with {len(media)} attachments" if media else ""
+            button_info = f" with {sum(len(row) for row in buttons)} button(s)" if buttons else ""
+            thread_info = f" topic:{telegram_thread_id}" if telegram_thread_id is not None else ""
+            return f"Message sent to {channel}:{chat_id}{thread_info}{media_info}{button_info}"
+        except Exception as exc:
+            return f"Error sending message: {str(exc)}"
+
+    _execute._morneven_thread_message_patch = True  # type: ignore[attr-defined]
+    MessageTool.execute = _execute
+    MessageTool._morneven_thread_message_patch = True
+
+
 def _patch_telegram_channel() -> None:
     try:
         from nanobot.channels.telegram import TelegramChannel
@@ -201,4 +362,5 @@ def _patch_telegram_channel() -> None:
         TelegramChannel._on_message = _on_message
 
 
+_patch_message_tool_thread_id()
 _patch_telegram_channel()
