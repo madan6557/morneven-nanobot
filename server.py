@@ -59,6 +59,7 @@ SECRET_FIELDS = {
 }
 
 BASE_DIR = Path(__file__).parent
+RUNTIME_PATCH_PATH = Path(os.environ.get("MORNEVEN_NANOBOT_PATCH_PATH", str(BASE_DIR))).expanduser().resolve()
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
@@ -92,6 +93,9 @@ def ensure_pythonpath_entry(env: dict[str, str], path: Path) -> None:
     if entry not in normalized:
         current.insert(0, entry)
     env["PYTHONPATH"] = os.pathsep.join(current)
+
+
+ensure_pythonpath_entry(os.environ, RUNTIME_PATCH_PATH)
 
 
 class BasicAuthBackend(AuthenticationBackend):
@@ -320,6 +324,27 @@ class GatewayManager:
             if stopped or not self.process_alive(pid):
                 self.clear_recorded_pid(pid)
 
+    def build_gateway_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        ensure_pythonpath_entry(env, RUNTIME_PATCH_PATH)
+        env["MORNEVEN_NANOBOT_PATCH_PATH"] = str(RUNTIME_PATCH_PATH)
+        if self.runtime_path:
+            runtime_home = self.runtime_path / "home"
+            runtime_home.mkdir(parents=True, exist_ok=True)
+            (runtime_home / ".nanobot" / "sessions").mkdir(parents=True, exist_ok=True)
+            (runtime_home / ".nanobot" / "cron").mkdir(parents=True, exist_ok=True)
+            env["HOME"] = str(runtime_home)
+        if self.workspace_path:
+            self.workspace_path.mkdir(parents=True, exist_ok=True)
+            env["NANOBOT_AGENTS__DEFAULTS__WORKSPACE"] = str(self.workspace_path)
+        if self.telegram_bot_username:
+            env["MORNEVEN_TELEGRAM_BOT_USERNAME"] = self.telegram_bot_username
+        if self.telegram_active_bot_usernames:
+            env["MORNEVEN_TELEGRAM_ACTIVE_BOTS"] = ",".join(self.telegram_active_bot_usernames)
+        if self.auto_dream_enabled is not None:
+            env["MORNEVEN_AUTO_DREAM_ENABLED"] = "1" if self.auto_dream_enabled else "0"
+        return env
+
     async def start(self):
         if self.process and self.process.returncode is None:
             return
@@ -341,28 +366,11 @@ class GatewayManager:
                 command.extend(["--workspace", str(self.workspace_path)])
             if self.gateway_port:
                 command.extend(["--port", str(self.gateway_port)])
-            env = os.environ.copy()
-            ensure_pythonpath_entry(env, BASE_DIR)
-            if self.runtime_path:
-                runtime_home = self.runtime_path / "home"
-                runtime_home.mkdir(parents=True, exist_ok=True)
-                (runtime_home / ".nanobot" / "sessions").mkdir(parents=True, exist_ok=True)
-                (runtime_home / ".nanobot" / "cron").mkdir(parents=True, exist_ok=True)
-                env["HOME"] = str(runtime_home)
-            if self.workspace_path:
-                self.workspace_path.mkdir(parents=True, exist_ok=True)
-                env["NANOBOT_AGENTS__DEFAULTS__WORKSPACE"] = str(self.workspace_path)
-            if self.telegram_bot_username:
-                env["MORNEVEN_TELEGRAM_BOT_USERNAME"] = self.telegram_bot_username
-            if self.telegram_active_bot_usernames:
-                env["MORNEVEN_TELEGRAM_ACTIVE_BOTS"] = ",".join(self.telegram_active_bot_usernames)
-            if self.auto_dream_enabled is not None:
-                env["MORNEVEN_AUTO_DREAM_ENABLED"] = "1" if self.auto_dream_enabled else "0"
             self.process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env=env,
+                env=self.build_gateway_env(),
                 start_new_session=True,
             )
             self.write_recorded_pid()
