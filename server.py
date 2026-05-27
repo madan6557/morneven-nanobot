@@ -238,20 +238,10 @@ class GatewayManager:
         except Exception:
             return None
 
-    def gateway_match_tokens(self) -> list[str]:
-        tokens = []
-        for path in (self.config_path, self.workspace_path, self.runtime_path):
-            if path:
-                tokens.append(str(path))
-                tokens.append(str(path.resolve()))
-        return [token for token in dict.fromkeys(tokens) if token]
-
-    def find_matching_gateway_pids(self) -> list[int]:
+    @staticmethod
+    def all_gateway_pids() -> list[int]:
         proc_dir = Path("/proc")
         if not proc_dir.exists():
-            return []
-        tokens = self.gateway_match_tokens()
-        if not tokens:
             return []
         current_pid = os.getpid()
         pids = []
@@ -261,9 +251,27 @@ class GatewayManager:
             pid = int(entry.name)
             if pid == current_pid:
                 continue
-            cmdline = self.commandline_for_pid(pid)
+            cmdline = GatewayManager.commandline_for_pid(pid)
             if not cmdline or "nanobot" not in cmdline or "gateway" not in cmdline:
                 continue
+            pids.append(pid)
+        return sorted(set(pids))
+
+    def gateway_match_tokens(self) -> list[str]:
+        tokens = []
+        for path in (self.config_path, self.workspace_path, self.runtime_path):
+            if path:
+                tokens.append(str(path))
+                tokens.append(str(path.resolve()))
+        return [token for token in dict.fromkeys(tokens) if token]
+
+    def find_matching_gateway_pids(self) -> list[int]:
+        tokens = self.gateway_match_tokens()
+        if not tokens:
+            return []
+        pids = []
+        for pid in self.all_gateway_pids():
+            cmdline = self.commandline_for_pid(pid)
             if any(token in cmdline for token in tokens):
                 pids.append(pid)
         return sorted(set(pids))
@@ -482,6 +490,8 @@ class MultiGatewayManager:
 
     @property
     def state(self):
+        if self.unmanaged_gateway_pids():
+            return "running"
         states = [runtime.get("state") for runtime in self.get_status().get("runtimes", [])]
         if any(state == "error" for state in states):
             return "error"
@@ -583,6 +593,7 @@ class MultiGatewayManager:
         await self.restart_all()
 
     async def start_all(self):
+        await self.stop_unmanaged_gateways()
         for runtime in self.runtimes_from_state():
             if isinstance(runtime, dict) and runtime.get("identityId"):
                 await self.start_identity(runtime["identityId"])
@@ -600,12 +611,35 @@ class MultiGatewayManager:
             runtime_ids.add(self.main_runtime_id())
         for identity_id in list(runtime_ids):
             await self.stop_identity(identity_id)
+        await self.stop_unmanaged_gateways()
 
     async def restart_all(self):
         await self.stop_all()
         await self.start_all()
 
+    def managed_gateway_pids(self) -> set[int]:
+        pids: set[int] = set()
+        for runtime in self.runtimes_from_state():
+            if isinstance(runtime, dict) and runtime.get("identityId"):
+                pids.update(self.ensure_gateway(runtime["identityId"]).tracked_gateway_pids())
+        for manager in self.gateways.values():
+            pids.update(manager.tracked_gateway_pids())
+        return pids
+
+    def unmanaged_gateway_pids(self) -> list[int]:
+        return sorted(set(GatewayManager.all_gateway_pids()) - self.managed_gateway_pids())
+
+    async def stop_unmanaged_gateways(self):
+        unmanaged = GatewayManager("unmanaged", "Unmanaged gateway")
+        for pid in self.unmanaged_gateway_pids():
+            stopped = await unmanaged.terminate_pid(pid)
+            if stopped:
+                self.logs.append(f"Stopped unmanaged gateway process: {pid}")
+            elif unmanaged.process_alive(pid):
+                self.logs.append(f"Failed to stop unmanaged gateway process: {pid}")
+
     async def start_identity(self, identity_id):
+        await self.stop_unmanaged_gateways()
         manager = self.ensure_gateway(identity_id)
         await manager.start()
         self.logs.append(f"Started runtime: {manager.name}")
@@ -613,6 +647,7 @@ class MultiGatewayManager:
     async def stop_identity(self, identity_id):
         manager = self.ensure_gateway(identity_id)
         await manager.stop()
+        await self.stop_unmanaged_gateways()
         self.logs.append(f"Stopped runtime: {manager.name}")
 
     async def restart_identity(self, identity_id):
@@ -641,6 +676,7 @@ class MultiGatewayManager:
     def get_status(self):
         runtimes = []
         seen = set()
+        unmanaged_pids = self.unmanaged_gateway_pids()
         for runtime in self.runtimes_from_state():
             if not isinstance(runtime, dict) or not runtime.get("identityId"):
                 continue
@@ -677,9 +713,17 @@ class MultiGatewayManager:
             if identity_id not in seen:
                 runtimes.append(manager.get_status())
         main = self.ensure_gateway(self.main_runtime_id())
+        main_status = main.get_status()
+        if unmanaged_pids and main_status.get("state") == "stopped":
+            main_status = {
+                **main_status,
+                "state": "running",
+                "lastError": "Unmanaged gateway process is still running",
+            }
         return {
-            **main.get_status(),
+            **main_status,
             "runtimes": runtimes,
+            "unmanagedGatewayPids": unmanaged_pids,
         }
 
 
