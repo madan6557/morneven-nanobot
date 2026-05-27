@@ -29,6 +29,18 @@ Morneven Backend remains the source of truth for credentials, personalities, wor
 | `morneven-backend` | Stores Bot Manager data and sends runtime bundles to Nanobot. |
 | `morneven_nanobot` | Executes active runtime personalities and gateways. |
 
+## Licensing And Attribution
+
+This repository is Morneven-specific runtime integration code. It installs and runs the upstream `nanobot-ai` Python package but does not claim ownership of upstream Nanobot.
+
+- This repository is licensed under the MIT License in `LICENSE`.
+- Upstream `nanobot-ai` is an open-source MIT licensed project by Xubin Ren and the nanobot contributors.
+- Upstream package source: https://github.com/HKUDS/nanobot
+- PyPI package: https://pypi.org/project/nanobot-ai/
+- Third-party attribution is tracked in `THIRD_PARTY_NOTICES.md`.
+
+The `Nanobot` and `nanobot-ai` names belong to their respective upstream maintainers. `morneven_nanobot` is a Morneven deployment wrapper and runtime patch layer around the upstream package.
+
 ## Current Capabilities
 
 - Single active personality mode.
