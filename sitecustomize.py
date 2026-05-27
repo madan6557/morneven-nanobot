@@ -190,9 +190,21 @@ def _record_topic(message: Any) -> None:
 
 def _runtime_config() -> dict[str, Any]:
     raw = os.environ.get("MORNEVEN_NANOBOT_CONFIG_PATH", "").strip()
-    if not raw:
-        return {}
-    return _read_json_file(Path(raw))
+    if raw:
+        config = _read_json_file(Path(raw))
+        if config:
+            return config
+    try:
+        from nanobot.config.loader import load_config
+
+        config = load_config()
+        if hasattr(config, "model_dump"):
+            payload = config.model_dump(by_alias=True)
+            if isinstance(payload, dict):
+                return payload
+    except Exception:
+        pass
+    return {}
 
 
 def _telegram_lock_config() -> dict[str, Any]:
@@ -203,18 +215,39 @@ def _telegram_lock_config() -> dict[str, Any]:
     return lock
 
 
-def _topic_lock_allows(chat_id: str, thread_id: str) -> bool:
+def _topic_lock_group(chat_id: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
     lock = _telegram_lock_config()
-    if lock.get("enabled") is not True:
-        return True
     groups = lock.get("groups") if isinstance(lock.get("groups"), list) else []
     group = next((item for item in groups if isinstance(item, dict) and str(item.get("chatId")) == str(chat_id)), None)
-    if not group:
-        return True
+    return lock, group
+
+
+def _group_topic_allows(group: dict[str, Any], thread_id: str) -> bool:
     if thread_id == "main":
         return group.get("allowMainTopic") is not False
     allowed = group.get("allowedTopicIds") if isinstance(group.get("allowedTopicIds"), list) else []
     return thread_id in {str(item).strip() for item in allowed}
+
+
+def _group_primary_topic(group: dict[str, Any]) -> str:
+    primary = _topic_id(group.get("primaryTopicId"))
+    if _group_topic_allows(group, primary):
+        return primary
+    allowed = group.get("allowedTopicIds") if isinstance(group.get("allowedTopicIds"), list) else []
+    for item in allowed:
+        topic = _topic_id(item)
+        if topic != "main" and _group_topic_allows(group, topic):
+            return topic
+    if _group_topic_allows(group, "main"):
+        return "main"
+    return ""
+
+
+def _topic_lock_allows(chat_id: str, thread_id: str) -> bool:
+    lock, group = _topic_lock_group(chat_id)
+    if lock.get("enabled") is not True or not group:
+        return True
+    return _group_topic_allows(group, thread_id)
 
 
 def _message_topic_allowed(message: Any) -> bool:
@@ -234,21 +267,90 @@ def _message_topic_allowed(message: Any) -> bool:
     return allowed
 
 
-def _outbound_topic_allowed(msg: Any) -> bool:
+def _metadata_thread_id(metadata: dict[str, Any]) -> str:
+    return _topic_id(
+        metadata.get(
+            "message_thread_id",
+            metadata.get("thread_id", metadata.get("topic_id")),
+        )
+    )
+
+
+def _has_explicit_metadata_thread(metadata: dict[str, Any]) -> bool:
+    for key in ("message_thread_id", "thread_id", "topic_id"):
+        if key not in metadata:
+            continue
+        value = metadata.get(key)
+        if _topic_id(value) != "main":
+            return True
+    return False
+
+
+def _coerced_metadata_thread_value(thread_id: str) -> int | str:
+    try:
+        return _coerce_message_thread_id(thread_id) if thread_id != "main" else "main"
+    except Exception:
+        return thread_id
+
+
+def _set_outbound_message_thread(msg: Any, thread_id: str) -> None:
+    metadata = getattr(msg, "metadata", None)
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if thread_id == "main":
+        metadata.pop("message_thread_id", None)
+        metadata.pop("thread_id", None)
+        metadata.pop("topic_id", None)
+    else:
+        metadata["message_thread_id"] = _coerced_metadata_thread_value(thread_id)
+    try:
+        setattr(msg, "metadata", metadata)
+    except Exception:
+        pass
+
+
+def _prepare_outbound_topic(msg: Any) -> bool:
     chat_id = str(getattr(msg, "chat_id", "") or "")
     if not chat_id.startswith("-"):
         return True
     metadata = getattr(msg, "metadata", None) or {}
-    thread_id = _topic_id(metadata.get("message_thread_id"))
-    allowed = _topic_lock_allows(chat_id, thread_id)
-    if not allowed:
+    if not isinstance(metadata, dict):
+        metadata = {}
+    thread_id = _metadata_thread_id(metadata)
+    lock, group = _topic_lock_group(chat_id)
+    if lock.get("enabled") is not True or not group:
+        return True
+    if _group_topic_allows(group, thread_id):
+        return True
+    primary_topic = _group_primary_topic(group)
+    if primary_topic and not _has_explicit_metadata_thread(metadata):
+        _set_outbound_message_thread(msg, primary_topic)
         print(
             "[morneven-topic-lock] "
-            f"topic_lock_block chat={chat_id or '-'} thread={thread_id} "
-            f"runtime={os.environ.get('MORNEVEN_RUNTIME_ID', '-') or '-'}",
+            f"topic_lock_redirect chat={chat_id or '-'} thread={thread_id} "
+            f"target={primary_topic} runtime={os.environ.get('MORNEVEN_RUNTIME_ID', '-') or '-'}",
             flush=True,
         )
-    return allowed
+        return True
+    print(
+        "[morneven-topic-lock] "
+        f"topic_lock_block chat={chat_id or '-'} thread={thread_id} "
+        f"runtime={os.environ.get('MORNEVEN_RUNTIME_ID', '-') or '-'}",
+        flush=True,
+    )
+    return False
+
+
+def _prepare_outbound_metadata(chat_id: str, metadata: dict[str, Any] | None) -> tuple[bool, dict[str, Any] | None]:
+    probe_metadata = metadata if isinstance(metadata, dict) else {}
+    probe = type("_MornevenOutboundProbe", (), {"chat_id": chat_id, "metadata": dict(probe_metadata)})()
+    allowed = _prepare_outbound_topic(probe)
+    if not allowed:
+        return False, metadata
+    next_metadata = getattr(probe, "metadata", probe_metadata)
+    if isinstance(next_metadata, dict) and next_metadata != probe_metadata:
+        return True, next_metadata
+    return True, metadata
 
 
 def _message_usernames(pattern: re.Pattern[str], text: str) -> set[str]:
@@ -714,7 +816,7 @@ def _patch_telegram_channel() -> None:
     if original_send and not getattr(original_send, "_morneven_topic_lock_filter", False):
 
         async def send(self: Any, msg: Any) -> None:
-            if not _outbound_topic_allowed(msg):
+            if not _prepare_outbound_topic(msg):
                 raise RuntimeError("Telegram topic blocked by Topic Lock")
             await original_send(self, msg)
 
@@ -725,10 +827,10 @@ def _patch_telegram_channel() -> None:
     if original_send_delta and not getattr(original_send_delta, "_morneven_topic_lock_filter", False):
 
         async def send_delta(self: Any, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
-            probe = type("_MornevenOutboundProbe", (), {"chat_id": chat_id, "metadata": metadata or {}})()
-            if not _outbound_topic_allowed(probe):
+            allowed, next_metadata = _prepare_outbound_metadata(chat_id, metadata)
+            if not allowed:
                 raise RuntimeError("Telegram topic blocked by Topic Lock")
-            await original_send_delta(self, chat_id, delta, metadata)
+            await original_send_delta(self, chat_id, delta, next_metadata)
 
         send_delta._morneven_topic_lock_filter = True  # type: ignore[attr-defined]
         TelegramChannel.send_delta = send_delta
