@@ -101,7 +101,7 @@ def _topic_id(value: Any) -> str:
     if value is None:
         return "main"
     text = str(value).strip()
-    if not text or text == "0" or text.lower() == "main":
+    if not text or text in {"0", "1"} or text.lower() == "main":
         return "main"
     return text
 
@@ -215,6 +215,22 @@ def _telegram_lock_config() -> dict[str, Any]:
     return lock
 
 
+def _topic_lock_has_group_rules(lock: dict[str, Any]) -> bool:
+    groups = lock.get("groups") if isinstance(lock.get("groups"), list) else []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        allowed = group.get("allowedTopicIds") if isinstance(group.get("allowedTopicIds"), list) else []
+        primary = _topic_id(group.get("primaryTopicId"))
+        if group.get("allowMainTopic") is False or len(allowed) > 0 or primary != "main":
+            return True
+    return False
+
+
+def _topic_lock_enabled(lock: dict[str, Any]) -> bool:
+    return lock.get("enabled") is True or _topic_lock_has_group_rules(lock)
+
+
 def _topic_lock_group(chat_id: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
     lock = _telegram_lock_config()
     groups = lock.get("groups") if isinstance(lock.get("groups"), list) else []
@@ -245,7 +261,7 @@ def _group_primary_topic(group: dict[str, Any]) -> str:
 
 def _topic_lock_allows(chat_id: str, thread_id: str) -> bool:
     lock, group = _topic_lock_group(chat_id)
-    if lock.get("enabled") is not True or not group:
+    if not _topic_lock_enabled(lock) or not group:
         return True
     return _group_topic_allows(group, thread_id)
 
@@ -318,7 +334,7 @@ def _prepare_outbound_topic(msg: Any) -> bool:
         metadata = {}
     thread_id = _metadata_thread_id(metadata)
     lock, group = _topic_lock_group(chat_id)
-    if lock.get("enabled") is not True or not group:
+    if not _topic_lock_enabled(lock) or not group:
         return True
     if _group_topic_allows(group, thread_id):
         return True

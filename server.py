@@ -1579,7 +1579,7 @@ def normalize_topic_id(value):
     if value is None:
         return "main"
     text = str(value).strip()
-    if not text or text == "0" or text.lower() == "main":
+    if not text or text in {"0", "1"} or text.lower() == "main":
         return "main"
     return text
 
