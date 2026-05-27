@@ -66,6 +66,30 @@ def _debug_routing(message: Any, username: str, targets: set[str], decision: str
     )
 
 
+def _debug_ingress(message: Any, username: str, targets: set[str], stage: str) -> None:
+    if not _routing_debug_enabled():
+        return
+    chat = getattr(message, "chat", None)
+    chat_type = getattr(chat, "type", "") or "-"
+    if chat_type == "private":
+        return
+    ordered_targets = ",".join(sorted(targets)) or "-"
+    reply_to = getattr(message, "reply_to_message", None)
+    reply_user = getattr(reply_to, "from_user", None)
+    reply_username = _normalize_username(getattr(reply_user, "username", None))
+    print(
+        "[morneven-telegram-ingress] "
+        f"stage={stage} bot={username or '-'} targets={ordered_targets} "
+        f"chat={_message_chat_id(message) or '-'} chat_type={chat_type} "
+        f"thread={_message_thread_id(message) or '-'} "
+        f"text={'1' if getattr(message, 'text', None) else '0'} "
+        f"caption={'1' if getattr(message, 'caption', None) else '0'} "
+        f"reply_to={reply_username or '-'} "
+        f"token={os.environ.get('MORNEVEN_TELEGRAM_TOKEN_FINGERPRINT', '-') or '-'}",
+        flush=True,
+    )
+
+
 def _message_usernames(pattern: re.Pattern[str], text: str) -> set[str]:
     return {_normalize_username(match) for match in pattern.findall(text) if _normalize_username(match)}
 
@@ -505,8 +529,12 @@ def _patch_telegram_channel() -> None:
         async def _on_message(self: Any, update: Any, context: Any) -> None:
             message = getattr(update, "message", None)
             await _cache_context_bot_username(self, context)
-            if message is not None and await _targeted_at_other_bot(self, message):
-                return
+            if message is not None:
+                username = await _bot_username(self)
+                targets = _message_target_usernames(_message_text(message), message)
+                _debug_ingress(message, username, targets, "on_message")
+                if await _targeted_at_other_bot(self, message):
+                    return
             await original_on_message(self, update, context)
 
         _on_message._morneven_target_filter = True  # type: ignore[attr-defined]
