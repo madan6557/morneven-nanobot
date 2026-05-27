@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import re
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -88,6 +91,164 @@ def _debug_ingress(message: Any, username: str, targets: set[str], stage: str) -
         f"token={os.environ.get('MORNEVEN_TELEGRAM_TOKEN_FINGERPRINT', '-') or '-'}",
         flush=True,
     )
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _topic_id(value: Any) -> str:
+    if value is None:
+        return "main"
+    text = str(value).strip()
+    if not text or text == "0" or text.lower() == "main":
+        return "main"
+    return text
+
+
+def _topics_path() -> Path | None:
+    raw = os.environ.get("MORNEVEN_TELEGRAM_TOPICS_PATH", "").strip()
+    return Path(raw) if raw else None
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        if path.exists():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+    except Exception:
+        pass
+    return {}
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _message_topic_title(message: Any, topic: str) -> str:
+    for attr in ("forum_topic_created", "forum_topic_edited"):
+        event = getattr(message, attr, None)
+        name = getattr(event, "name", None)
+        if name:
+            return str(name)
+    return "Main topic" if topic == "main" else f"Topic {topic}"
+
+
+def _record_topic(message: Any) -> None:
+    path = _topics_path()
+    if not path:
+        return
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        return
+    chat_type = getattr(chat, "type", None)
+    if chat_type == "private":
+        return
+    now = _now_iso()
+    topic = _topic_id(getattr(message, "message_thread_id", None))
+    registry = _read_json_file(path)
+    groups = registry.get("groups") if isinstance(registry.get("groups"), list) else []
+    chat_id_text = str(chat_id)
+    group = next((item for item in groups if isinstance(item, dict) and str(item.get("chatId")) == chat_id_text), None)
+    if not group:
+        group = {
+            "chatId": chat_id_text,
+            "title": str(getattr(chat, "title", "") or ""),
+            "isForum": bool(getattr(chat, "is_forum", False)),
+            "lastSeenAt": now,
+            "source": "observed",
+            "topics": [],
+        }
+        groups.append(group)
+    else:
+        group["title"] = str(getattr(chat, "title", "") or group.get("title") or "")
+        group["isForum"] = bool(getattr(chat, "is_forum", group.get("isForum", False)))
+        group["lastSeenAt"] = now
+    topics = group.get("topics") if isinstance(group.get("topics"), list) else []
+    topic_entry = next((item for item in topics if isinstance(item, dict) and _topic_id(item.get("messageThreadId")) == topic), None)
+    if not topic_entry:
+        topics.append({
+            "messageThreadId": topic,
+            "title": _message_topic_title(message, topic),
+            "lastSeenAt": now,
+            "source": "observed",
+        })
+    else:
+        topic_entry["title"] = topic_entry.get("title") or _message_topic_title(message, topic)
+        topic_entry["lastSeenAt"] = now
+        topic_entry["source"] = "observed" if topic_entry.get("source") != "manual" else "manual"
+    group["topics"] = topics
+    registry["groups"] = groups
+    _write_json_file(path, registry)
+
+
+def _runtime_config() -> dict[str, Any]:
+    raw = os.environ.get("MORNEVEN_NANOBOT_CONFIG_PATH", "").strip()
+    if not raw:
+        return {}
+    return _read_json_file(Path(raw))
+
+
+def _telegram_lock_config() -> dict[str, Any]:
+    config = _runtime_config()
+    channels = config.get("channels") if isinstance(config.get("channels"), dict) else {}
+    telegram = channels.get("telegram") if isinstance(channels.get("telegram"), dict) else {}
+    lock = telegram.get("topicLock") if isinstance(telegram.get("topicLock"), dict) else {}
+    return lock
+
+
+def _topic_lock_allows(chat_id: str, thread_id: str) -> bool:
+    lock = _telegram_lock_config()
+    if lock.get("enabled") is not True:
+        return True
+    groups = lock.get("groups") if isinstance(lock.get("groups"), list) else []
+    group = next((item for item in groups if isinstance(item, dict) and str(item.get("chatId")) == str(chat_id)), None)
+    if not group:
+        return True
+    if thread_id == "main":
+        return group.get("allowMainTopic") is not False
+    allowed = group.get("allowedTopicIds") if isinstance(group.get("allowedTopicIds"), list) else []
+    return thread_id in {str(item).strip() for item in allowed}
+
+
+def _message_topic_allowed(message: Any) -> bool:
+    chat = getattr(message, "chat", None)
+    if getattr(chat, "type", None) == "private":
+        return True
+    chat_id = _message_chat_id(message)
+    thread_id = _topic_id(getattr(message, "message_thread_id", None))
+    allowed = _topic_lock_allows(chat_id, thread_id)
+    if not allowed:
+        print(
+            "[morneven-topic-lock] "
+            f"topic_lock_drop chat={chat_id or '-'} thread={thread_id} "
+            f"runtime={os.environ.get('MORNEVEN_RUNTIME_ID', '-') or '-'}",
+            flush=True,
+        )
+    return allowed
+
+
+def _outbound_topic_allowed(msg: Any) -> bool:
+    chat_id = str(getattr(msg, "chat_id", "") or "")
+    if not chat_id.startswith("-"):
+        return True
+    metadata = getattr(msg, "metadata", None) or {}
+    thread_id = _topic_id(metadata.get("message_thread_id"))
+    allowed = _topic_lock_allows(chat_id, thread_id)
+    if not allowed:
+        print(
+            "[morneven-topic-lock] "
+            f"topic_lock_block chat={chat_id or '-'} thread={thread_id} "
+            f"runtime={os.environ.get('MORNEVEN_RUNTIME_ID', '-') or '-'}",
+            flush=True,
+        )
+    return allowed
 
 
 def _message_usernames(pattern: re.Pattern[str], text: str) -> set[str]:
@@ -496,6 +657,9 @@ def _patch_telegram_channel() -> None:
             message = getattr(update, "message", None)
             await _cache_context_bot_username(self, context)
             if message is not None:
+                _record_topic(message)
+                if not _message_topic_allowed(message):
+                    return
                 if await _targeted_at_other_bot(self, message):
                     return
                 if not await _command_allowed_for_group(self, message):
@@ -514,6 +678,9 @@ def _patch_telegram_channel() -> None:
             message = getattr(update, "message", None)
             await _cache_context_bot_username(self, context)
             if message is not None:
+                _record_topic(message)
+                if not _message_topic_allowed(message):
+                    return
                 if await _targeted_at_other_bot(self, message):
                     return
                 if not await _command_allowed_for_group(self, message):
@@ -530,6 +697,9 @@ def _patch_telegram_channel() -> None:
             message = getattr(update, "message", None)
             await _cache_context_bot_username(self, context)
             if message is not None:
+                _record_topic(message)
+                if not _message_topic_allowed(message):
+                    return
                 username = await _bot_username(self)
                 targets = _message_target_usernames(_message_text(message), message)
                 _debug_ingress(message, username, targets, "on_message")
@@ -539,6 +709,29 @@ def _patch_telegram_channel() -> None:
 
         _on_message._morneven_target_filter = True  # type: ignore[attr-defined]
         TelegramChannel._on_message = _on_message
+
+    original_send = getattr(TelegramChannel, "send", None)
+    if original_send and not getattr(original_send, "_morneven_topic_lock_filter", False):
+
+        async def send(self: Any, msg: Any) -> None:
+            if not _outbound_topic_allowed(msg):
+                raise RuntimeError("Telegram topic blocked by Topic Lock")
+            await original_send(self, msg)
+
+        send._morneven_topic_lock_filter = True  # type: ignore[attr-defined]
+        TelegramChannel.send = send
+
+    original_send_delta = getattr(TelegramChannel, "send_delta", None)
+    if original_send_delta and not getattr(original_send_delta, "_morneven_topic_lock_filter", False):
+
+        async def send_delta(self: Any, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
+            probe = type("_MornevenOutboundProbe", (), {"chat_id": chat_id, "metadata": metadata or {}})()
+            if not _outbound_topic_allowed(probe):
+                raise RuntimeError("Telegram topic blocked by Topic Lock")
+            await original_send_delta(self, chat_id, delta, metadata)
+
+        send_delta._morneven_topic_lock_filter = True  # type: ignore[attr-defined]
+        TelegramChannel.send_delta = send_delta
 
 
 def _auto_dream_enabled() -> bool:

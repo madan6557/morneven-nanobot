@@ -377,6 +377,12 @@ class GatewayManager:
         if self.workspace_path:
             self.workspace_path.mkdir(parents=True, exist_ok=True)
             env["NANOBOT_AGENTS__DEFAULTS__WORKSPACE"] = str(self.workspace_path)
+        if self.config_path:
+            env["MORNEVEN_NANOBOT_CONFIG_PATH"] = str(self.config_path)
+        if self.runtime_path:
+            env["MORNEVEN_TELEGRAM_TOPICS_PATH"] = str(self.runtime_path / "telegram-topics.json")
+        env["MORNEVEN_RUNTIME_ID"] = str(self.identity_id or "")
+        env["MORNEVEN_RUNTIME_NAME"] = str(self.name or "")
         if self.telegram_bot_username:
             env["MORNEVEN_TELEGRAM_BOT_USERNAME"] = self.telegram_bot_username
         if self.telegram_token_fingerprint:
@@ -1475,6 +1481,7 @@ def materialize_runtime_entry(
         "runtimePath": str(runtime_dir),
         "workspacePath": str(workspace_path),
         "configPath": str(config_path),
+        "telegramTopicsPath": str(runtime_dir / "telegram-topics.json"),
         "gatewayPort": gateway_port,
         "telegramBotUsername": normalize_bot_username(telegram_bot_username) or None,
         "telegramTokenFingerprint": telegram_token_fingerprint or None,
@@ -1566,6 +1573,51 @@ def load_morneven_runtime_state():
         "fileCount": 0,
         "files": [],
     }
+
+
+def normalize_topic_id(value):
+    if value is None:
+        return "main"
+    text = str(value).strip()
+    if not text or text == "0" or text.lower() == "main":
+        return "main"
+    return text
+
+
+def load_telegram_topics(path):
+    try:
+        topic_path = Path(path)
+        if topic_path.exists():
+            payload = json.loads(topic_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("groups"), list):
+                return payload
+    except Exception:
+        pass
+    return {"groups": []}
+
+
+def runtime_telegram_topics(runtime):
+    path = runtime.get("telegramTopicsPath") or (
+        str(Path(runtime.get("runtimePath")) / "telegram-topics.json") if runtime.get("runtimePath") else ""
+    )
+    topics = load_telegram_topics(path) if path else {"groups": []}
+    return {
+        "identityId": runtime.get("identityId"),
+        "identity": {
+            "id": runtime.get("identityId"),
+            "slug": runtime.get("slug"),
+            "name": runtime.get("name"),
+        },
+        "groups": topics.get("groups", []),
+    }
+
+
+def list_telegram_topics():
+    state = load_morneven_runtime_state()
+    runtimes = state.get("runtimes") if isinstance(state, dict) else None
+    if isinstance(runtimes, list) and runtimes:
+        return {"ok": True, "runtimes": [runtime_telegram_topics(runtime) for runtime in runtimes if isinstance(runtime, dict)]}
+    return {"ok": True, "groups": []}
 
 
 async def sync_morneven_runtime(strict=False):
@@ -1913,6 +1965,13 @@ async def api_morneven_config_secrets(request: Request):
     })
 
 
+async def api_morneven_telegram_topics(request: Request):
+    auth_err = require_morneven_token(request)
+    if auth_err:
+        return auth_err
+    return JSONResponse(list_telegram_topics())
+
+
 async def api_morneven_runtime_gateway_action(request: Request):
     auth_err = require_morneven_token(request)
     if auth_err:
@@ -2031,6 +2090,7 @@ routes = [
     Route("/api/morneven/reload", api_morneven_reload, methods=["POST"]),
     Route("/api/morneven/workspace/changes", api_morneven_workspace_changes),
     Route("/api/morneven/config-secrets", api_morneven_config_secrets),
+    Route("/api/morneven/telegram/topics", api_morneven_telegram_topics),
 ]
 
 app = Starlette(
