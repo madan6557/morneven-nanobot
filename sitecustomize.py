@@ -34,6 +34,38 @@ def _message_text(message: Any) -> str:
     return str(text).strip()
 
 
+def _routing_debug_enabled() -> bool:
+    value = os.environ.get("MORNEVEN_TELEGRAM_ROUTING_DEBUG", "1").strip().lower()
+    return value not in {"0", "false", "off", "no"}
+
+
+def _message_chat_id(message: Any) -> str:
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    return str(chat_id or "")
+
+
+def _message_thread_id(message: Any) -> str:
+    thread_id = getattr(message, "message_thread_id", None)
+    return str(thread_id or "")
+
+
+def _debug_routing(message: Any, username: str, targets: set[str], decision: str, reason: str) -> None:
+    if not _routing_debug_enabled():
+        return
+    if not targets:
+        return
+    ordered_targets = ",".join(sorted(targets))
+    print(
+        "[morneven-telegram-routing] "
+        f"bot={username or '-'} targets={ordered_targets or '-'} decision={decision} "
+        f"reason={reason} chat={_message_chat_id(message) or '-'} "
+        f"thread={_message_thread_id(message) or '-'} "
+        f"token={os.environ.get('MORNEVEN_TELEGRAM_TOKEN_FINGERPRINT', '-') or '-'}",
+        flush=True,
+    )
+
+
 def _message_usernames(pattern: re.Pattern[str], text: str) -> set[str]:
     return {_normalize_username(match) for match in pattern.findall(text) if _normalize_username(match)}
 
@@ -182,24 +214,34 @@ async def _targeted_at_other_bot(channel: Any, message: Any) -> bool:
     if not username:
         return False
 
-    if _message_mentions_bot(username, text, message):
+    targets = _message_target_usernames(text, message)
+    if username in targets or _message_mentions_bot(username, text, message):
+        _debug_routing(message, username, targets, "allow", "targeted_current_bot")
         return False
 
     command_targets = _message_usernames(COMMAND_TARGETS_RE, text)
-    registered_mentions = _registered_bot_mentions(text, message)
+    registered_mentions = targets & _env_usernames("MORNEVEN_TELEGRAM_ACTIVE_BOTS")
     if registered_mentions:
+        _debug_routing(message, username, targets, "drop", "targeted_other_registered_bot")
         return True
 
     if command_targets:
+        _debug_routing(message, username, targets, "drop", "targeted_other_command")
         return True
 
     command_match = COMMAND_TARGET_RE.match(text)
     if command_match:
-        return _normalize_username(command_match.group(1)) != username
+        is_other = _normalize_username(command_match.group(1)) != username
+        if is_other:
+            _debug_routing(message, username, targets, "drop", "leading_other_command")
+        return is_other
 
     mention_match = LEADING_MENTION_RE.match(text)
     if mention_match:
-        return _normalize_username(mention_match.group(1)) != username
+        is_other = _normalize_username(mention_match.group(1)) != username
+        if is_other:
+            _debug_routing(message, username, targets, "drop", "leading_other_mention")
+        return is_other
 
     return False
 

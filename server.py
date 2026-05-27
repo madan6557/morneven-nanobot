@@ -150,6 +150,7 @@ class GatewayManager:
         workspace_path=None,
         gateway_port=None,
         telegram_bot_username=None,
+        telegram_token_fingerprint=None,
         telegram_active_bot_usernames=None,
         auto_dream_enabled=None,
     ):
@@ -160,6 +161,7 @@ class GatewayManager:
         self.workspace_path = Path(workspace_path).expanduser() if workspace_path else None
         self.gateway_port = int(gateway_port) if gateway_port else None
         self.telegram_bot_username = str(telegram_bot_username or "").strip().lstrip("@")
+        self.telegram_token_fingerprint = str(telegram_token_fingerprint or "").strip()
         self.telegram_active_bot_usernames = [
             str(username).strip().lstrip("@")
             for username in (telegram_active_bot_usernames or [])
@@ -377,6 +379,8 @@ class GatewayManager:
             env["NANOBOT_AGENTS__DEFAULTS__WORKSPACE"] = str(self.workspace_path)
         if self.telegram_bot_username:
             env["MORNEVEN_TELEGRAM_BOT_USERNAME"] = self.telegram_bot_username
+        if self.telegram_token_fingerprint:
+            env["MORNEVEN_TELEGRAM_TOKEN_FINGERPRINT"] = self.telegram_token_fingerprint
         if self.telegram_active_bot_usernames:
             env["MORNEVEN_TELEGRAM_ACTIVE_BOTS"] = ",".join(self.telegram_active_bot_usernames)
         if self.auto_dream_enabled is not None:
@@ -507,6 +511,7 @@ class GatewayManager:
             "restart_count": self.restart_count,
             "gatewayPort": self.gateway_port,
             "telegramBotUsername": self.telegram_bot_username or None,
+            "telegramTokenFingerprint": self.telegram_token_fingerprint or None,
             "lastError": self.last_error or ("Gateway process is detached from manager" if pid and self.state == "stopped" else None),
             "lastExitCode": self.last_exit_code,
             "lastLogLine": self.logs[-1] if self.logs else None,
@@ -569,6 +574,7 @@ class MultiGatewayManager:
             workspace_path = runtime.get("workspacePath")
             gateway_port = runtime.get("gatewayPort")
             telegram_bot_username = runtime.get("telegramBotUsername")
+            telegram_token_fingerprint = runtime.get("telegramTokenFingerprint")
             telegram_active_bot_usernames = runtime.get("telegramActiveBotUsernames")
             auto_dream_enabled = runtime.get("autoDreamEnabled")
         else:
@@ -579,6 +585,7 @@ class MultiGatewayManager:
             workspace_path = None
             gateway_port = None
             telegram_bot_username = None
+            telegram_token_fingerprint = None
             telegram_active_bot_usernames = None
             auto_dream_enabled = None
         manager = self.gateways.get(runtime_id)
@@ -591,6 +598,7 @@ class MultiGatewayManager:
                 workspace_path,
                 gateway_port,
                 telegram_bot_username,
+                telegram_token_fingerprint,
                 telegram_active_bot_usernames,
                 auto_dream_enabled,
             )
@@ -602,6 +610,7 @@ class MultiGatewayManager:
             manager.workspace_path = Path(workspace_path).expanduser() if workspace_path else None
             manager.gateway_port = int(gateway_port) if gateway_port else None
             manager.telegram_bot_username = str(telegram_bot_username or "").strip().lstrip("@")
+            manager.telegram_token_fingerprint = str(telegram_token_fingerprint or "").strip()
             manager.telegram_active_bot_usernames = [
                 str(username).strip().lstrip("@")
                 for username in (telegram_active_bot_usernames or [])
@@ -1228,6 +1237,13 @@ def normalize_bot_username(value):
     return str(value or "").strip().lstrip("@")
 
 
+def token_fingerprint(value):
+    token = str(value or "").strip()
+    if not token:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+
 def telegram_token_from_entry(entry):
     channels = entry.get("channels") if isinstance(entry, dict) else None
     if not isinstance(channels, dict):
@@ -1265,18 +1281,23 @@ def telegram_username_for_token(token):
 
 def telegram_usernames_for_entries(entries):
     usernames_by_identity = {}
+    token_fingerprints_by_identity = {}
     active_usernames = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else {}
         identity_id = str(identity.get("id") or "")
-        username = telegram_username_for_token(telegram_token_from_entry(entry))
+        token = telegram_token_from_entry(entry)
+        fingerprint = token_fingerprint(token)
+        username = telegram_username_for_token(token)
+        if identity_id and fingerprint:
+            token_fingerprints_by_identity[identity_id] = fingerprint
         if username:
             if identity_id:
                 usernames_by_identity[identity_id] = username
             active_usernames.append(username)
-    return usernames_by_identity, active_usernames
+    return usernames_by_identity, token_fingerprints_by_identity, active_usernames
 
 
 def apply_bundle_to_config(bundle, workspace_path=WORKSPACE_PATH, config_path=None, persist_default=True, gateway_port=None):
@@ -1389,6 +1410,7 @@ def materialize_runtime_entry(
     main_identity_id,
     gateway_port,
     telegram_bot_username="",
+    telegram_token_fingerprint="",
     telegram_active_bot_usernames=None,
     persist_default=False,
 ):
@@ -1455,6 +1477,7 @@ def materialize_runtime_entry(
         "configPath": str(config_path),
         "gatewayPort": gateway_port,
         "telegramBotUsername": normalize_bot_username(telegram_bot_username) or None,
+        "telegramTokenFingerprint": telegram_token_fingerprint or None,
         "telegramActiveBotUsernames": [
             normalize_bot_username(username)
             for username in (telegram_active_bot_usernames or [])
@@ -1484,7 +1507,7 @@ def materialize_morneven_runtime(bundle):
     main_identity = bundle.get("mainIdentity") if isinstance(bundle.get("mainIdentity"), dict) else bundle.get("activeIdentity", {})
     main_identity_id = str(main_identity.get("id") or entries[0]["identity"].get("id"))
     general_config = bundle.get("generalConfig") if isinstance(bundle.get("generalConfig"), dict) else {}
-    telegram_usernames_by_identity, telegram_active_usernames = telegram_usernames_for_entries(entries)
+    telegram_usernames_by_identity, telegram_token_fingerprints_by_identity, telegram_active_usernames = telegram_usernames_for_entries(entries)
     runtimes = []
     for index, entry in enumerate(entries):
         identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else {}
@@ -1497,6 +1520,7 @@ def materialize_morneven_runtime(bundle):
             main_identity_id,
             GATEWAY_BASE_PORT + index,
             telegram_usernames_by_identity.get(identity_id, ""),
+            telegram_token_fingerprints_by_identity.get(identity_id, ""),
             telegram_active_usernames,
             persist_default=persist_default,
         ))
