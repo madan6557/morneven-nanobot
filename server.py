@@ -81,6 +81,19 @@ if not ADMIN_PASSWORD:
     print(f"Generated admin password: {ADMIN_PASSWORD}")
 
 
+def ensure_pythonpath_entry(env: dict[str, str], path: Path) -> None:
+    entry = str(path.resolve())
+    current = [
+        item
+        for item in env.get("PYTHONPATH", "").split(os.pathsep)
+        if item
+    ]
+    normalized = {str(Path(item).resolve()) for item in current if item}
+    if entry not in normalized:
+        current.insert(0, entry)
+    env["PYTHONPATH"] = os.pathsep.join(current)
+
+
 class BasicAuthBackend(AuthenticationBackend):
     async def authenticate(self, conn):
         if "Authorization" not in conn.headers:
@@ -157,8 +170,165 @@ class GatewayManager:
         self.last_exit_code: int | None = None
         self._read_tasks: list[asyncio.Task] = []
 
+    def pid_path(self) -> Path | None:
+        if not self.runtime_path:
+            return None
+        return self.runtime_path / "gateway.pid"
+
+    def read_recorded_pid(self) -> int | None:
+        pid_path = self.pid_path()
+        if not pid_path or not pid_path.exists():
+            return None
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+            return pid if pid > 0 else None
+        except Exception:
+            return None
+
+    def write_recorded_pid(self) -> None:
+        pid_path = self.pid_path()
+        if not pid_path or not self.process or not self.process.pid:
+            return
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(self.process.pid), encoding="utf-8")
+
+    def clear_recorded_pid(self, pid: int | None = None) -> None:
+        pid_path = self.pid_path()
+        if not pid_path or not pid_path.exists():
+            return
+        if pid is not None:
+            recorded_pid = self.read_recorded_pid()
+            if recorded_pid != pid:
+                return
+        try:
+            pid_path.unlink()
+        except FileNotFoundError:
+            return
+
+    @staticmethod
+    def process_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def pid_looks_like_gateway(pid: int) -> bool:
+        cmdline = GatewayManager.commandline_for_pid(pid)
+        if cmdline is None:
+            return True
+        return "nanobot" in cmdline and "gateway" in cmdline
+
+    @staticmethod
+    def commandline_for_pid(pid: int) -> str | None:
+        cmdline_path = Path(f"/proc/{pid}/cmdline")
+        if not cmdline_path.exists():
+            return None
+        try:
+            return cmdline_path.read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+    def gateway_match_tokens(self) -> list[str]:
+        tokens = []
+        for path in (self.config_path, self.workspace_path, self.runtime_path):
+            if path:
+                tokens.append(str(path))
+                tokens.append(str(path.resolve()))
+        return [token for token in dict.fromkeys(tokens) if token]
+
+    def find_matching_gateway_pids(self) -> list[int]:
+        proc_dir = Path("/proc")
+        if not proc_dir.exists():
+            return []
+        tokens = self.gateway_match_tokens()
+        if not tokens:
+            return []
+        current_pid = os.getpid()
+        pids = []
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == current_pid:
+                continue
+            cmdline = self.commandline_for_pid(pid)
+            if not cmdline or "nanobot" not in cmdline or "gateway" not in cmdline:
+                continue
+            if any(token in cmdline for token in tokens):
+                pids.append(pid)
+        return sorted(set(pids))
+
+    def tracked_gateway_pids(self) -> list[int]:
+        pids = []
+        if self.process and self.process.returncode is None and self.process.pid:
+            pids.append(self.process.pid)
+        recorded_pid = self.read_recorded_pid()
+        if recorded_pid:
+            pids.append(recorded_pid)
+        pids.extend(self.find_matching_gateway_pids())
+        return sorted({pid for pid in pids if pid and self.process_alive(pid)})
+
+    async def wait_for_pid_exit(self, pid: int, timeout: float) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.process_alive(pid):
+                return True
+            await asyncio.sleep(0.2)
+        return not self.process_alive(pid)
+
+    def send_signal_to_pid(self, pid: int, sig: int) -> bool:
+        if pid <= 0 or pid == os.getpid() or not self.process_alive(pid) or not self.pid_looks_like_gateway(pid):
+            return False
+        try:
+            if hasattr(os, "killpg"):
+                pgid = os.getpgid(pid)
+                if pgid != os.getpgrp():
+                    os.killpg(pgid, sig)
+                else:
+                    os.kill(pid, sig)
+            else:
+                os.kill(pid, sig)
+        except ProcessLookupError:
+            return False
+        except Exception:
+            try:
+                os.kill(pid, sig)
+            except Exception:
+                return False
+        return True
+
+    async def terminate_pid(self, pid: int, timeout: float = 10) -> bool:
+        if not self.send_signal_to_pid(pid, signal.SIGTERM):
+            return False
+        if await self.wait_for_pid_exit(pid, timeout):
+            return True
+        if not self.send_signal_to_pid(pid, signal.SIGKILL):
+            return False
+        return await self.wait_for_pid_exit(pid, 3)
+
+    async def stop_recorded_process(self) -> None:
+        for pid in self.tracked_gateway_pids():
+            if self.process and self.process.pid == pid and self.process.returncode is None:
+                continue
+            stopped = await self.terminate_pid(pid)
+            if stopped or not self.process_alive(pid):
+                self.clear_recorded_pid(pid)
+
     async def start(self):
         if self.process and self.process.returncode is None:
+            return
+        await self.stop_recorded_process()
+        remaining_pids = self.tracked_gateway_pids()
+        if remaining_pids:
+            self.state = "error"
+            self.last_error = f"Existing gateway process is still running: {', '.join(str(pid) for pid in remaining_pids)}"
+            self.logs.append(self.last_error)
             return
         self.state = "starting"
         self.last_error = None
@@ -172,6 +342,7 @@ class GatewayManager:
             if self.gateway_port:
                 command.extend(["--port", str(self.gateway_port)])
             env = os.environ.copy()
+            ensure_pythonpath_entry(env, BASE_DIR)
             if self.runtime_path:
                 runtime_home = self.runtime_path / "home"
                 runtime_home.mkdir(parents=True, exist_ok=True)
@@ -192,7 +363,9 @@ class GatewayManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
+                start_new_session=True,
             )
+            self.write_recorded_pid()
             self.state = "running"
             self.start_time = time.time()
             task = asyncio.create_task(self._read_output())
@@ -204,15 +377,35 @@ class GatewayManager:
 
     async def stop(self):
         if not self.process or self.process.returncode is not None:
-            self.state = "stopped"
+            self.state = "stopping"
+            await self.stop_recorded_process()
+            remaining_pids = self.tracked_gateway_pids()
+            if remaining_pids:
+                self.state = "error"
+                self.last_error = f"Failed to stop gateway process: {', '.join(str(pid) for pid in remaining_pids)}"
+                self.logs.append(self.last_error)
+            else:
+                self.state = "stopped"
+                self.start_time = None
             return
         self.state = "stopping"
-        self.process.terminate()
+        pid = self.process.pid
+        self.send_signal_to_pid(pid, signal.SIGTERM)
         try:
             await asyncio.wait_for(self.process.wait(), timeout=10)
         except asyncio.TimeoutError:
-            self.process.kill()
-            await self.process.wait()
+            self.send_signal_to_pid(pid, signal.SIGKILL)
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                pass
+        remaining_pids = self.tracked_gateway_pids()
+        if remaining_pids:
+            self.state = "error"
+            self.last_error = f"Failed to stop gateway process: {', '.join(str(pid) for pid in remaining_pids)}"
+            self.logs.append(self.last_error)
+            return
+        self.clear_recorded_pid(pid)
         self.state = "stopped"
         self.start_time = None
 
@@ -234,6 +427,7 @@ class GatewayManager:
             return
         if self.process and self.process.returncode is not None:
             self.last_exit_code = self.process.returncode
+            self.clear_recorded_pid(self.process.pid)
             if self.state == "running":
                 if self.process.returncode == 0:
                     self.state = "stopped"
@@ -246,14 +440,19 @@ class GatewayManager:
         pid = None
         if self.process and self.process.returncode is None:
             pid = self.process.pid
+        elif self.state == "stopped":
+            matching_pids = self.tracked_gateway_pids()
+            if matching_pids:
+                pid = matching_pids[0]
         uptime = None
-        if self.start_time and self.state == "running":
+        status_state = "running" if pid and self.state == "stopped" else self.state
+        if self.start_time and status_state == "running":
             uptime = int(time.time() - self.start_time)
         started_at = None
-        if self.start_time and self.state == "running":
+        if self.start_time and status_state == "running":
             started_at = datetime.fromtimestamp(self.start_time, timezone.utc).isoformat()
         return {
-            "state": self.state,
+            "state": status_state,
             "identityId": self.identity_id,
             "name": self.name,
             "pid": pid,
@@ -262,7 +461,7 @@ class GatewayManager:
             "restart_count": self.restart_count,
             "gatewayPort": self.gateway_port,
             "telegramBotUsername": self.telegram_bot_username or None,
-            "lastError": self.last_error,
+            "lastError": self.last_error or ("Gateway process is detached from manager" if pid and self.state == "stopped" else None),
             "lastExitCode": self.last_exit_code,
             "lastLogLine": self.logs[-1] if self.logs else None,
         }
@@ -275,8 +474,14 @@ class MultiGatewayManager:
 
     @property
     def state(self):
-        main = self.main_gateway()
-        return main.state if main else "stopped"
+        states = [runtime.get("state") for runtime in self.get_status().get("runtimes", [])]
+        if any(state == "error" for state in states):
+            return "error"
+        if any(state == "running" for state in states):
+            return "running"
+        if any(state in {"starting", "stopping"} for state in states):
+            return "starting"
+        return "stopped"
 
     def runtime_state(self):
         return load_morneven_runtime_state()
@@ -361,13 +566,36 @@ class MultiGatewayManager:
         return self.ensure_gateway(self.main_runtime_id())
 
     async def start(self):
-        await self.start_identity(self.main_runtime_id())
+        await self.start_all()
 
     async def stop(self):
-        await self.stop_identity(self.main_runtime_id())
+        await self.stop_all()
 
     async def restart(self):
-        await self.restart_identity(self.main_runtime_id())
+        await self.restart_all()
+
+    async def start_all(self):
+        for runtime in self.runtimes_from_state():
+            if isinstance(runtime, dict) and runtime.get("identityId"):
+                await self.start_identity(runtime["identityId"])
+        if not self.runtimes_from_state():
+            await self.start_identity(self.main_runtime_id())
+
+    async def stop_all(self):
+        runtime_ids = {
+            str(runtime["identityId"])
+            for runtime in self.runtimes_from_state()
+            if isinstance(runtime, dict) and runtime.get("identityId")
+        }
+        runtime_ids.update(self.gateways.keys())
+        if not runtime_ids:
+            runtime_ids.add(self.main_runtime_id())
+        for identity_id in list(runtime_ids):
+            await self.stop_identity(identity_id)
+
+    async def restart_all(self):
+        await self.stop_all()
+        await self.start_all()
 
     async def start_identity(self, identity_id):
         manager = self.ensure_gateway(identity_id)
@@ -1741,10 +1969,11 @@ if __name__ == "__main__":
     server = uvicorn.Server(config)
 
     def handle_signal():
-        loop.create_task(gateway.stop())
+        loop.create_task(gateway.stop_all())
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, handle_signal)
 
     loop.run_until_complete(server.serve(sockets=sockets))
+    loop.run_until_complete(gateway.stop_all())
