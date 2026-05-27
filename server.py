@@ -76,6 +76,7 @@ RUNTIME_STATE_PATH = WORKSPACE_PATH / ".morneven-runtime.json"
 RUNTIME_MANIFEST_PATH = WORKSPACE_PATH / ".morneven-runtime-manifest.json"
 MAX_WORKSPACE_SYNC_BYTES = 500_000
 GATEWAY_BASE_PORT = int(os.environ.get("NANOBOT_GATEWAY_BASE_PORT", "18790"))
+GATEWAY_LOG_MAX_BYTES = int(os.environ.get("NANOBOT_GATEWAY_LOG_MAX_BYTES", "2000000"))
 
 if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = secrets.token_urlsafe(16)
@@ -178,6 +179,35 @@ class GatewayManager:
         if not self.runtime_path:
             return None
         return self.runtime_path / "gateway.pid"
+
+    def log_path(self) -> Path | None:
+        if not self.runtime_path:
+            return None
+        return self.runtime_path / "gateway.log"
+
+    def record_log(self, line: str) -> None:
+        self.logs.append(line)
+        log_path = self.log_path()
+        if not log_path:
+            return
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+            if log_path.stat().st_size > GATEWAY_LOG_MAX_BYTES:
+                data = log_path.read_bytes()[-GATEWAY_LOG_MAX_BYTES:]
+                log_path.write_bytes(data)
+        except Exception:
+            return
+
+    def read_persisted_logs(self, limit: int = 500) -> list[str]:
+        log_path = self.log_path()
+        if not log_path or not log_path.exists():
+            return []
+        try:
+            return log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+        except Exception:
+            return []
 
     def read_recorded_pid(self) -> int | None:
         pid_path = self.pid_path()
@@ -361,7 +391,7 @@ class GatewayManager:
         if remaining_pids:
             self.state = "error"
             self.last_error = f"Existing gateway process is still running: {', '.join(str(pid) for pid in remaining_pids)}"
-            self.logs.append(self.last_error)
+            self.record_log(self.last_error)
             return
         self.state = "starting"
         self.last_error = None
@@ -389,7 +419,7 @@ class GatewayManager:
         except Exception as e:
             self.state = "error"
             self.last_error = f"Failed to start gateway: {e}"
-            self.logs.append(self.last_error)
+            self.record_log(self.last_error)
 
     async def stop(self):
         if not self.process or self.process.returncode is not None:
@@ -399,7 +429,7 @@ class GatewayManager:
             if remaining_pids:
                 self.state = "error"
                 self.last_error = f"Failed to stop gateway process: {', '.join(str(pid) for pid in remaining_pids)}"
-                self.logs.append(self.last_error)
+                self.record_log(self.last_error)
             else:
                 self.state = "stopped"
                 self.start_time = None
@@ -419,7 +449,7 @@ class GatewayManager:
         if remaining_pids:
             self.state = "error"
             self.last_error = f"Failed to stop gateway process: {', '.join(str(pid) for pid in remaining_pids)}"
-            self.logs.append(self.last_error)
+            self.record_log(self.last_error)
             return
         self.clear_recorded_pid(pid)
         self.state = "stopped"
@@ -438,7 +468,7 @@ class GatewayManager:
                     break
                 decoded = line.decode("utf-8", errors="replace").rstrip()
                 cleaned = ANSI_ESCAPE.sub("", decoded)
-                self.logs.append(f"[{self.name}] {cleaned}")
+                self.record_log(f"[{self.name}] {cleaned}")
         except asyncio.CancelledError:
             return
         if self.process and self.process.returncode is not None:
@@ -450,7 +480,7 @@ class GatewayManager:
                 else:
                     self.state = "error"
                     self.last_error = f"Gateway exited with code {self.process.returncode}"
-                    self.logs.append(self.last_error)
+                    self.record_log(self.last_error)
 
     def get_status(self) -> dict:
         pid = None
@@ -1699,7 +1729,14 @@ async def api_logs(request: Request):
         return auth_err
     lines = list(gateway.logs)
     for manager in gateway.gateways.values():
-        lines.extend(list(manager.logs)[-200:])
+        runtime_lines = list(manager.logs)[-200:] or manager.read_persisted_logs(200)
+        lines.extend(runtime_lines)
+    if not lines:
+        for runtime in gateway.runtimes_from_state():
+            if not isinstance(runtime, dict) or not runtime.get("identityId"):
+                continue
+            manager = gateway.ensure_gateway(runtime["identityId"])
+            lines.extend(manager.read_persisted_logs(200))
     return JSONResponse({"lines": lines[-500:]})
 
 
@@ -1713,6 +1750,11 @@ async def api_runtime_logs(request: Request):
     lines = []
     if manager:
         lines.extend(list(manager.logs)[-500:])
+        if not lines:
+            lines.extend(manager.read_persisted_logs(500))
+    elif runtime:
+        manager = gateway.ensure_gateway(identity_id)
+        lines.extend(manager.read_persisted_logs(500))
     if runtime and not lines:
         lines.append(f"[{runtime.get('name') or runtime.get('slug') or identity_id}] No runtime logs available.")
     return JSONResponse({"lines": lines[-500:]})
