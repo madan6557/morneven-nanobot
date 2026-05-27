@@ -38,14 +38,53 @@ def _message_usernames(pattern: re.Pattern[str], text: str) -> set[str]:
     return {_normalize_username(match) for match in pattern.findall(text) if _normalize_username(match)}
 
 
-def _message_mentions_bot(username: str, text: str) -> bool:
+def _message_entity_usernames(message: Any, text: str) -> set[str]:
+    usernames: set[str] = set()
+    entities = getattr(message, "entities", None) or getattr(message, "caption_entities", None) or []
+    for entity in entities:
+        entity_type = str(getattr(entity, "type", "") or "")
+        if entity_type == "text_mention":
+            user = getattr(entity, "user", None)
+            username = _normalize_username(getattr(user, "username", None))
+            if username:
+                usernames.add(username)
+            continue
+        if entity_type != "mention":
+            continue
+        mention = ""
+        extract_from = getattr(entity, "extract_from", None)
+        if callable(extract_from):
+            try:
+                mention = str(extract_from(text) or "")
+            except Exception:
+                mention = ""
+        if not mention:
+            try:
+                offset = int(getattr(entity, "offset", 0) or 0)
+                length = int(getattr(entity, "length", 0) or 0)
+                mention = text[offset:offset + length]
+            except Exception:
+                mention = ""
+        username = _normalize_username(mention)
+        if username:
+            usernames.add(username)
+    return usernames
+
+
+def _message_target_usernames(text: str, message: Any | None = None) -> set[str]:
+    targets = _message_usernames(COMMAND_TARGETS_RE, text) | _message_usernames(MENTIONS_RE, text)
+    if message is not None:
+        targets |= _message_entity_usernames(message, text)
+    return targets
+
+
+def _message_mentions_bot(username: str, text: str, message: Any | None = None) -> bool:
     if not username:
         return False
     command_targets = _message_usernames(COMMAND_TARGETS_RE, text)
     if username in command_targets:
         return True
-    mentions = _message_usernames(MENTIONS_RE, text)
-    return username in mentions
+    return username in _message_target_usernames(text, message)
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -68,13 +107,17 @@ def _coerce_message_thread_id(value: Any) -> int | None:
 
 
 async def _bot_username(channel: Any) -> str:
-    env_username = _env_username("MORNEVEN_TELEGRAM_BOT_USERNAME")
-    if env_username:
-        return env_username
+    resolved = _normalize_username(getattr(channel, "_morneven_resolved_bot_username", None))
+    if resolved:
+        return resolved
 
     cached = _normalize_username(getattr(channel, "_bot_username", None))
     if cached:
         return cached
+
+    env_username = _env_username("MORNEVEN_TELEGRAM_BOT_USERNAME")
+    if env_username:
+        return env_username
 
     ensure_identity = getattr(channel, "_ensure_bot_identity", None)
     if callable(ensure_identity):
@@ -82,6 +125,7 @@ async def _bot_username(channel: Any) -> str:
             _, username = await _maybe_await(ensure_identity())
             username = _normalize_username(username)
             if username:
+                setattr(channel, "_morneven_resolved_bot_username", username)
                 return username
         except Exception:
             return ""
@@ -89,12 +133,44 @@ async def _bot_username(channel: Any) -> str:
     return ""
 
 
-def _registered_bot_mentions(text: str) -> set[str]:
+async def _username_from_bot(bot: Any) -> str:
+    if not bot:
+        return ""
+
+    username = _normalize_username(getattr(bot, "username", None))
+    if username:
+        return username
+
+    get_me = getattr(bot, "get_me", None)
+    if not callable(get_me):
+        return ""
+    try:
+        me = await _maybe_await(get_me())
+    except Exception:
+        return ""
+    if isinstance(me, dict):
+        return _normalize_username(me.get("username"))
+    return _normalize_username(getattr(me, "username", None))
+
+
+async def _cache_context_bot_username(channel: Any, context: Any) -> None:
+    candidates = []
+    if context is not None:
+        candidates.append(getattr(context, "bot", None))
+        application = getattr(context, "application", None)
+        candidates.append(getattr(application, "bot", None))
+    for candidate in candidates:
+        username = await _username_from_bot(candidate)
+        if username:
+            setattr(channel, "_morneven_resolved_bot_username", username)
+            return
+
+
+def _registered_bot_mentions(text: str, message: Any | None = None) -> set[str]:
     registered = _env_usernames("MORNEVEN_TELEGRAM_ACTIVE_BOTS")
     if not registered:
         return set()
-    message_targets = _message_usernames(COMMAND_TARGETS_RE, text) | _message_usernames(MENTIONS_RE, text)
-    return message_targets & registered
+    return _message_target_usernames(text, message) & registered
 
 
 async def _targeted_at_other_bot(channel: Any, message: Any) -> bool:
@@ -106,11 +182,11 @@ async def _targeted_at_other_bot(channel: Any, message: Any) -> bool:
     if not username:
         return False
 
-    if _message_mentions_bot(username, text):
+    if _message_mentions_bot(username, text, message):
         return False
 
     command_targets = _message_usernames(COMMAND_TARGETS_RE, text)
-    registered_mentions = _registered_bot_mentions(text)
+    registered_mentions = _registered_bot_mentions(text, message)
     if registered_mentions:
         return True
 
@@ -333,11 +409,11 @@ def _patch_telegram_channel() -> None:
         async def _is_group_message_for_bot(self: Any, message: Any) -> bool:
             text = _message_text(message)
             username = await _bot_username(self)
-            if username and _message_mentions_bot(username, text):
+            if username and _message_mentions_bot(username, text, message):
                 return True
             command_targets = _message_usernames(COMMAND_TARGETS_RE, text)
-            mentions = _message_usernames(MENTIONS_RE, text)
-            registered_mentions = _registered_bot_mentions(text)
+            mentions = _message_target_usernames(text, message)
+            registered_mentions = _registered_bot_mentions(text, message)
             if username and registered_mentions:
                 return False
             if username and (command_targets or mentions):
@@ -352,6 +428,7 @@ def _patch_telegram_channel() -> None:
 
         async def _forward_command(self: Any, update: Any, context: Any) -> None:
             message = getattr(update, "message", None)
+            await _cache_context_bot_username(self, context)
             if message is not None:
                 if await _targeted_at_other_bot(self, message):
                     return
@@ -369,6 +446,7 @@ def _patch_telegram_channel() -> None:
 
         async def _command_handler(self: Any, update: Any, context: Any, _original: Any = original) -> None:
             message = getattr(update, "message", None)
+            await _cache_context_bot_username(self, context)
             if message is not None:
                 if await _targeted_at_other_bot(self, message):
                     return
@@ -384,6 +462,7 @@ def _patch_telegram_channel() -> None:
 
         async def _on_message(self: Any, update: Any, context: Any) -> None:
             message = getattr(update, "message", None)
+            await _cache_context_bot_username(self, context)
             if message is not None and await _targeted_at_other_bot(self, message):
                 return
             await original_on_message(self, update, context)
