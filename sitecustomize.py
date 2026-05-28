@@ -6,7 +6,9 @@ import inspect
 import json
 import os
 import re
+import shlex
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,10 @@ COMMAND_TARGET_RE = re.compile(r"^/[A-Za-z0-9_-]+@([A-Za-z0-9_]+)(?=$|\s)")
 LEADING_MENTION_RE = re.compile(r"^@([A-Za-z0-9_]+)(?=$|\s)")
 COMMAND_TARGETS_RE = re.compile(r"(?:^|\s)/[A-Za-z0-9_-]+@([A-Za-z0-9_]+)(?=$|\s)")
 MENTIONS_RE = re.compile(r"@([A-Za-z0-9_]+)(?=$|\s|[.,!?;:])")
+SEND_TOPIC_COMMAND_RE = re.compile(r"send_topic_message\.py\s+['\"]?(-?\d+)['\"]?\s+['\"]?([A-Za-z0-9_-]+)['\"]?")
+
+_CURRENT_REQUEST_CONTEXT: ContextVar[dict[str, Any]] = ContextVar("morneven_request_context", default={})
+_CURRENT_MESSAGE_TOOL: ContextVar[Any | None] = ContextVar("morneven_message_tool", default=None)
 
 
 def _normalize_username(value: Any) -> str:
@@ -442,6 +448,84 @@ def _coerce_message_thread_id(value: Any) -> int | None:
     return int(text)
 
 
+def _context_value(args: tuple[Any, ...], kwargs: dict[str, Any], index: int, key: str) -> Any:
+    if len(args) > index:
+        return args[index]
+    return kwargs.get(key)
+
+
+def _store_agent_loop_context(self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    channel = _context_value(args, kwargs, 0, "channel")
+    chat_id = _context_value(args, kwargs, 1, "chat_id")
+    message_id = _context_value(args, kwargs, 2, "message_id")
+    metadata = _context_value(args, kwargs, 3, "metadata")
+    session_key = _context_value(args, kwargs, 4, "session_key")
+    _CURRENT_REQUEST_CONTEXT.set({
+        "channel": str(channel or ""),
+        "chat_id": str(chat_id or ""),
+        "message_id": str(message_id or ""),
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "session_key": str(session_key or ""),
+    })
+    tools = getattr(self, "tools", None)
+    message_tool = tools.get("message") if isinstance(tools, dict) else None
+    _CURRENT_MESSAGE_TOOL.set(message_tool if message_tool is not None else None)
+
+
+def _send_topic_command_target(command: str) -> tuple[str, str] | None:
+    try:
+        parts = shlex.split(command)
+    except Exception:
+        parts = []
+    for index, part in enumerate(parts):
+        if not str(part).endswith("send_topic_message.py"):
+            continue
+        if len(parts) <= index + 2:
+            return None
+        return str(parts[index + 1]), _topic_id(parts[index + 2])
+    match = SEND_TOPIC_COMMAND_RE.search(command)
+    if not match:
+        return None
+    return str(match.group(1)), _topic_id(match.group(2))
+
+
+def _exec_result_succeeded(result: Any) -> bool:
+    text = str(result or "")
+    match = re.search(r"Exit code:\s*(-?\d+)", text)
+    if match:
+        return match.group(1) == "0"
+    return not text.strip().lower().startswith("error")
+
+
+def _mark_current_turn_sent_from_exec(command: str, result: Any) -> None:
+    target = _send_topic_command_target(command)
+    if not target or not _exec_result_succeeded(result):
+        return
+    chat_id, thread_id = target
+    context = _CURRENT_REQUEST_CONTEXT.get({})
+    if context.get("channel") != "telegram":
+        return
+    if str(context.get("chat_id") or "") != chat_id:
+        return
+    metadata = context.get("metadata") if isinstance(context, dict) else {}
+    current_thread_id = _metadata_thread_id(metadata) if isinstance(metadata, dict) else "main"
+    if current_thread_id != thread_id:
+        return
+    message_tool = _CURRENT_MESSAGE_TOOL.get(None)
+    if message_tool is None:
+        return
+    try:
+        message_tool._sent_in_turn = True
+    except Exception:
+        return
+    print(
+        "[morneven-telegram-delivery] "
+        f"suppress_final_after_exec chat={chat_id} thread={thread_id} "
+        f"runtime={os.environ.get('MORNEVEN_RUNTIME_ID', '-') or '-'}",
+        flush=True,
+    )
+
+
 async def _bot_username(channel: Any) -> str:
     resolved = _normalize_username(getattr(channel, "_morneven_resolved_bot_username", None))
     if resolved:
@@ -563,6 +647,46 @@ async def _command_allowed_for_group(channel: Any, message: Any) -> bool:
             return False
 
     return True
+
+
+def _patch_agent_loop_context_marker() -> None:
+    try:
+        from nanobot.agent.loop import AgentLoop
+    except Exception:
+        return
+
+    original = getattr(AgentLoop, "_set_tool_context", None)
+    if not original or getattr(original, "_morneven_context_marker_patch", False):
+        return
+
+    def _set_tool_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original(self, *args, **kwargs)
+        _store_agent_loop_context(self, args, kwargs)
+        return result
+
+    _set_tool_context._morneven_context_marker_patch = True  # type: ignore[attr-defined]
+    AgentLoop._set_tool_context = _set_tool_context
+
+
+def _patch_exec_tool_delivery_marker() -> None:
+    try:
+        from nanobot.agent.tools.shell import ExecTool
+    except Exception:
+        return
+
+    original = getattr(ExecTool, "execute", None)
+    if not original or getattr(original, "_morneven_delivery_marker_patch", False):
+        return
+
+    async def execute(self: Any, *args: Any, **kwargs: Any) -> Any:
+        command = str(kwargs.get("command") or kwargs.get("cmd") or (args[0] if args else "") or "")
+        result = await _maybe_await(original(self, *args, **kwargs))
+        if command:
+            _mark_current_turn_sent_from_exec(command, result)
+        return result
+
+    execute._morneven_delivery_marker_patch = True  # type: ignore[attr-defined]
+    ExecTool.execute = execute
 
 
 def _patch_message_tool_thread_id() -> None:
@@ -990,6 +1114,8 @@ def _patch_cron_auto_dream() -> None:
 
 
 _patch_message_tool_thread_id()
+_patch_agent_loop_context_marker()
+_patch_exec_tool_delivery_marker()
 _patch_telegram_channel()
 _patch_agent_runner_usage()
 _patch_cron_auto_dream()
