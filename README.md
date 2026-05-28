@@ -1,5 +1,7 @@
 # Morneven Nanobot Runtime
 
+Version: `1.0.0-rc.1`
+
 `morneven_nanobot` is the Nanobot runtime service used by Morneven Bot Manager. It runs one or more Nanobot gateways, hosts a Basic Auth protected runtime dashboard, materializes active personality workspaces, and applies Morneven runtime safety patches for Telegram routing, topic locks, runtime sync, and process control.
 
 The canonical Morneven documentation lives in the shared workspace `Document/` folder.
