@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -852,6 +853,110 @@ def _patch_telegram_channel() -> None:
         TelegramChannel.send_delta = send_delta
 
 
+def _usage_events_path() -> Path | None:
+    raw = os.environ.get("MORNEVEN_USAGE_EVENTS_PATH", "").strip()
+    return Path(raw) if raw else None
+
+
+def _usage_int(value: Any) -> int:
+    try:
+        number = int(value or 0)
+    except Exception:
+        return 0
+    return max(number, 0)
+
+
+def _usage_value(usage: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        if key in usage:
+            return _usage_int(usage.get(key))
+    return 0
+
+
+def _runtime_provider_name(runner: Any, spec: Any) -> str:
+    provider = getattr(runner, "provider", None)
+    for source in (provider, getattr(provider, "_spec", None), getattr(provider, "spec", None)):
+        for attr in ("name", "provider", "provider_name", "id"):
+            value = getattr(source, attr, None)
+            if value:
+                return str(value)
+    for attr in ("provider", "provider_name"):
+        value = getattr(spec, attr, None)
+        if value:
+            return str(value)
+    if provider is not None:
+        name = provider.__class__.__name__
+        if name:
+            return name
+    return ""
+
+
+def _runtime_model_name(runner: Any, spec: Any) -> str:
+    for source in (spec, getattr(runner, "provider", None)):
+        for attr in ("model", "model_id", "default_model"):
+            value = getattr(source, attr, None)
+            if value:
+                return str(value)
+    return ""
+
+
+def _record_usage_event(runner: Any, spec: Any, result: Any) -> None:
+    path = _usage_events_path()
+    if not path:
+        return
+    usage = getattr(result, "usage", None)
+    if not isinstance(usage, dict):
+        return
+    prompt_tokens = _usage_value(usage, "prompt_tokens", "input_tokens", "input")
+    completion_tokens = _usage_value(usage, "completion_tokens", "output_tokens", "output")
+    cached_tokens = _usage_value(usage, "cached_tokens", "input_cached_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    total_tokens = _usage_value(usage, "total_tokens", "tokens")
+    if total_tokens <= 0:
+        total_tokens = prompt_tokens + completion_tokens + cached_tokens
+    if total_tokens <= 0:
+        return
+    event = {
+        "eventId": str(uuid.uuid4()),
+        "recordedAt": _now_iso(),
+        "runtimeId": os.environ.get("MORNEVEN_RUNTIME_ID", ""),
+        "runtimeName": os.environ.get("MORNEVEN_RUNTIME_NAME", ""),
+        "provider": _runtime_provider_name(runner, spec),
+        "model": _runtime_model_name(runner, spec),
+        "sessionKey": str(getattr(spec, "session_key", "") or ""),
+        "promptTokens": prompt_tokens,
+        "completionTokens": completion_tokens,
+        "cachedTokens": cached_tokens,
+        "totalTokens": total_tokens,
+        "requestCount": 1,
+        "stopReason": str(getattr(result, "stop_reason", "") or ""),
+        "usage": usage,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+    except Exception:
+        return
+
+
+def _patch_agent_runner_usage() -> None:
+    try:
+        from nanobot.agent.runner import AgentRunner
+    except Exception:
+        return
+    original_run = getattr(AgentRunner, "run", None)
+    if not original_run or getattr(original_run, "_morneven_usage_patch", False):
+        return
+
+    async def run(self: Any, spec: Any) -> Any:
+        result = await original_run(self, spec)
+        _record_usage_event(self, spec, result)
+        return result
+
+    run._morneven_usage_patch = True  # type: ignore[attr-defined]
+    AgentRunner.run = run
+
+
 def _auto_dream_enabled() -> bool:
     value = os.environ.get("MORNEVEN_AUTO_DREAM_ENABLED", "").strip().lower()
     return value not in {"0", "false", "off", "no"}
@@ -886,4 +991,5 @@ def _patch_cron_auto_dream() -> None:
 
 _patch_message_tool_thread_id()
 _patch_telegram_channel()
+_patch_agent_runner_usage()
 _patch_cron_auto_dream()

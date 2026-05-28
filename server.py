@@ -381,6 +381,7 @@ class GatewayManager:
             env["MORNEVEN_NANOBOT_CONFIG_PATH"] = str(self.config_path)
         if self.runtime_path:
             env["MORNEVEN_TELEGRAM_TOPICS_PATH"] = str(self.runtime_path / "telegram-topics.json")
+            env["MORNEVEN_USAGE_EVENTS_PATH"] = str(self.runtime_path / "provider-usage.jsonl")
         env["MORNEVEN_RUNTIME_ID"] = str(self.identity_id or "")
         env["MORNEVEN_RUNTIME_NAME"] = str(self.name or "")
         if self.telegram_bot_username:
@@ -1482,6 +1483,7 @@ def materialize_runtime_entry(
         "workspacePath": str(workspace_path),
         "configPath": str(config_path),
         "telegramTopicsPath": str(runtime_dir / "telegram-topics.json"),
+        "usageEventsPath": str(runtime_dir / "provider-usage.jsonl"),
         "gatewayPort": gateway_port,
         "telegramBotUsername": normalize_bot_username(telegram_bot_username) or None,
         "telegramTokenFingerprint": telegram_token_fingerprint or None,
@@ -1618,6 +1620,64 @@ def list_telegram_topics():
     if isinstance(runtimes, list) and runtimes:
         return {"ok": True, "runtimes": [runtime_telegram_topics(runtime) for runtime in runtimes if isinstance(runtime, dict)]}
     return {"ok": True, "groups": []}
+
+
+def parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def load_usage_events(path, start=None, end=None):
+    event_path = Path(path)
+    if not event_path.exists():
+        return []
+    events = []
+    try:
+        lines = event_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+    for line in lines[-5000:]:
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+        recorded_at = parse_iso_datetime(event.get("recordedAt"))
+        if start and recorded_at and recorded_at < start:
+            continue
+        if end and recorded_at and recorded_at >= end:
+            continue
+        events.append(event)
+    return events
+
+
+def list_provider_usage_events(start=None, end=None):
+    state = load_morneven_runtime_state()
+    runtimes = state.get("runtimes") if isinstance(state, dict) else None
+    events = []
+    if isinstance(runtimes, list) and runtimes:
+        for runtime in runtimes:
+            if not isinstance(runtime, dict):
+                continue
+            path = runtime.get("usageEventsPath") or (
+                str(Path(runtime.get("runtimePath")) / "provider-usage.jsonl") if runtime.get("runtimePath") else ""
+            )
+            if path:
+                events.extend(load_usage_events(path, start, end))
+    else:
+        events.extend(load_usage_events(WORKSPACE_PATH.parent / "provider-usage.jsonl", start, end))
+    return {
+        "ok": True,
+        "events": events[-5000:],
+        "count": len(events[-5000:]),
+    }
 
 
 async def sync_morneven_runtime(strict=False):
@@ -1972,6 +2032,15 @@ async def api_morneven_telegram_topics(request: Request):
     return JSONResponse(list_telegram_topics())
 
 
+async def api_morneven_provider_usage(request: Request):
+    auth_err = require_morneven_token(request)
+    if auth_err:
+        return auth_err
+    start = parse_iso_datetime(request.query_params.get("from"))
+    end = parse_iso_datetime(request.query_params.get("to"))
+    return JSONResponse(list_provider_usage_events(start, end))
+
+
 async def api_morneven_runtime_gateway_action(request: Request):
     auth_err = require_morneven_token(request)
     if auth_err:
@@ -2091,6 +2160,7 @@ routes = [
     Route("/api/morneven/workspace/changes", api_morneven_workspace_changes),
     Route("/api/morneven/config-secrets", api_morneven_config_secrets),
     Route("/api/morneven/telegram/topics", api_morneven_telegram_topics),
+    Route("/api/morneven/provider-usage", api_morneven_provider_usage),
 ]
 
 app = Starlette(
