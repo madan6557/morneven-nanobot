@@ -323,8 +323,7 @@ Recommended native behavior:
 
 Active shared documentation:
 
-- [Platform Architecture](../Document/Documentation/General/2026-05-25-platform-architecture-v01.md)
-- [Bot Manager Guide](../Document/Guide/General/2026-05-27-bot-manager-guide-v01.md)
-- [Bot Manager Alpha Deployment Guide](../Document/Guide/General/2026-05-21-bot-manager-alpha-deployment-guide-v01.md)
-- [Backend API Contract](../Document/Documentation/Backend/root-docs/2026-05-25-backend-api-contract-v01.md)
-- [Document Index](../Document/Documentation/General/2026-05-27-document-index-v02.md)
+- [Platform Architecture](../Document/Documentation/General/2026-05-29-platform-architecture-v02.md)
+- [Bot Manager Guide](../Document/Guide/General/2026-05-29-bot-manager-guide-v02.md)
+- [Backend API Contract](../Document/Documentation/Backend/root-docs/2026-05-29-backend-api-contract-v02.md)
+- [Document Index](../Document/Documentation/General/2026-05-29-document-index-v03.md)
