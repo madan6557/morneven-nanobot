@@ -77,6 +77,9 @@ RUNTIME_MANIFEST_PATH = WORKSPACE_PATH / ".morneven-runtime-manifest.json"
 MAX_WORKSPACE_SYNC_BYTES = 500_000
 GATEWAY_BASE_PORT = int(os.environ.get("NANOBOT_GATEWAY_BASE_PORT", "18790"))
 GATEWAY_LOG_MAX_BYTES = int(os.environ.get("NANOBOT_GATEWAY_LOG_MAX_BYTES", "2000000"))
+GATEWAY_AUTO_RESTART_ENABLED = os.environ.get("NANOBOT_GATEWAY_AUTO_RESTART", "1").strip().lower() not in {"0", "false", "off", "no"}
+GATEWAY_RESTART_BASE_DELAY_SECONDS = max(int(os.environ.get("NANOBOT_GATEWAY_RESTART_BASE_DELAY_SECONDS", "5")), 1)
+GATEWAY_RESTART_MAX_DELAY_SECONDS = max(int(os.environ.get("NANOBOT_GATEWAY_RESTART_MAX_DELAY_SECONDS", "300")), 1)
 
 if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = secrets.token_urlsafe(16)
@@ -175,7 +178,11 @@ class GatewayManager:
         self.restart_count = 0
         self.last_error: str | None = None
         self.last_exit_code: int | None = None
+        self.desired_state = "stopped"
+        self.last_unplanned_exit_at: str | None = None
+        self.last_restart_at: str | None = None
         self._read_tasks: list[asyncio.Task] = []
+        self._restart_task: asyncio.Task | None = None
 
     def pid_path(self) -> Path | None:
         if not self.runtime_path:
@@ -396,6 +403,7 @@ class GatewayManager:
 
     async def start(self):
         if self.process and self.process.returncode is None:
+            self.desired_state = "running"
             return
         await self.stop_recorded_process()
         remaining_pids = self.tracked_gateway_pids()
@@ -404,6 +412,7 @@ class GatewayManager:
             self.last_error = f"Existing gateway process is still running: {', '.join(str(pid) for pid in remaining_pids)}"
             self.record_log(self.last_error)
             return
+        self.process = None
         self.state = "starting"
         self.last_error = None
         self.last_exit_code = None
@@ -424,6 +433,7 @@ class GatewayManager:
             )
             self.write_recorded_pid()
             self.state = "running"
+            self.desired_state = "running"
             self.start_time = time.time()
             task = asyncio.create_task(self._read_output())
             self._read_tasks.append(task)
@@ -433,6 +443,9 @@ class GatewayManager:
             self.record_log(self.last_error)
 
     async def stop(self):
+        self.desired_state = "stopped"
+        if self._restart_task and not self._restart_task.done():
+            self._restart_task.cancel()
         if not self.process or self.process.returncode is not None:
             self.state = "stopping"
             await self.stop_recorded_process()
@@ -444,6 +457,7 @@ class GatewayManager:
             else:
                 self.state = "stopped"
                 self.start_time = None
+                self.process = None
             return
         self.state = "stopping"
         pid = self.process.pid
@@ -465,11 +479,45 @@ class GatewayManager:
         self.clear_recorded_pid(pid)
         self.state = "stopped"
         self.start_time = None
+        self.process = None
 
     async def restart(self):
+        self.desired_state = "running"
         await self.stop()
+        self.desired_state = "running"
         self.restart_count += 1
         await self.start()
+
+    def schedule_restart_after_exit(self, exit_code: int | None) -> None:
+        if not GATEWAY_AUTO_RESTART_ENABLED or self.desired_state != "running":
+            return
+        if self._restart_task and not self._restart_task.done():
+            return
+        self.last_unplanned_exit_at = datetime.now(timezone.utc).isoformat()
+        delay = min(
+            GATEWAY_RESTART_BASE_DELAY_SECONDS * max(self.restart_count + 1, 1),
+            GATEWAY_RESTART_MAX_DELAY_SECONDS,
+        )
+        message = f"Gateway exited unexpectedly with code {exit_code}; restarting in {delay}s"
+        self.last_error = message
+        self.record_log(message)
+        self._restart_task = asyncio.create_task(self._restart_after_delay(delay))
+
+    async def _restart_after_delay(self, delay: int):
+        try:
+            await asyncio.sleep(delay)
+            if self.desired_state != "running":
+                return
+            if self.process and self.process.returncode is None:
+                return
+            self.restart_count += 1
+            self.last_restart_at = datetime.now(timezone.utc).isoformat()
+            self.record_log("Restarting gateway after unplanned exit")
+            await self.start()
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._restart_task = None
 
     async def _read_output(self):
         try:
@@ -486,12 +534,10 @@ class GatewayManager:
             self.last_exit_code = self.process.returncode
             self.clear_recorded_pid(self.process.pid)
             if self.state == "running":
-                if self.process.returncode == 0:
-                    self.state = "stopped"
-                else:
-                    self.state = "error"
-                    self.last_error = f"Gateway exited with code {self.process.returncode}"
-                    self.record_log(self.last_error)
+                self.state = "stopped"
+                self.start_time = None
+                self.schedule_restart_after_exit(self.process.returncode)
+            self.process = None
 
     def get_status(self) -> dict:
         pid = None
@@ -521,6 +567,10 @@ class GatewayManager:
             "telegramTokenFingerprint": self.telegram_token_fingerprint or None,
             "lastError": self.last_error or ("Gateway process is detached from manager" if pid and self.state == "stopped" else None),
             "lastExitCode": self.last_exit_code,
+            "desiredState": self.desired_state,
+            "autoRestartEnabled": GATEWAY_AUTO_RESTART_ENABLED,
+            "lastUnplannedExitAt": self.last_unplanned_exit_at,
+            "lastRestartAt": self.last_restart_at,
             "lastLogLine": self.logs[-1] if self.logs else None,
         }
 
