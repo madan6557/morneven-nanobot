@@ -74,10 +74,12 @@ WORKSPACE_PATH = Path(
 RUNTIMES_ROOT = WORKSPACE_PATH.parent / "runtimes"
 RUNTIME_STATE_PATH = WORKSPACE_PATH / ".morneven-runtime.json"
 RUNTIME_MANIFEST_PATH = WORKSPACE_PATH / ".morneven-runtime-manifest.json"
+GATEWAY_DESIRED_STATE_PATH = WORKSPACE_PATH / ".morneven-gateway-desired-state.json"
 MAX_WORKSPACE_SYNC_BYTES = 500_000
 GATEWAY_BASE_PORT = int(os.environ.get("NANOBOT_GATEWAY_BASE_PORT", "18790"))
 GATEWAY_LOG_MAX_BYTES = int(os.environ.get("NANOBOT_GATEWAY_LOG_MAX_BYTES", "2000000"))
 GATEWAY_AUTO_RESTART_ENABLED = os.environ.get("NANOBOT_GATEWAY_AUTO_RESTART", "1").strip().lower() not in {"0", "false", "off", "no"}
+GATEWAY_RESTORE_ON_START_ENABLED = os.environ.get("NANOBOT_GATEWAY_RESTORE_ON_START", "1").strip().lower() not in {"0", "false", "off", "no"}
 GATEWAY_RESTART_BASE_DELAY_SECONDS = max(int(os.environ.get("NANOBOT_GATEWAY_RESTART_BASE_DELAY_SECONDS", "5")), 1)
 GATEWAY_RESTART_MAX_DELAY_SECONDS = max(int(os.environ.get("NANOBOT_GATEWAY_RESTART_MAX_DELAY_SECONDS", "300")), 1)
 
@@ -100,6 +102,33 @@ def ensure_pythonpath_entry(env: dict[str, str], path: Path) -> None:
 
 
 ensure_pythonpath_entry(os.environ, RUNTIME_PATCH_PATH)
+
+
+def load_gateway_desired_state() -> dict:
+    try:
+        if GATEWAY_DESIRED_STATE_PATH.exists():
+            data = json.loads(GATEWAY_DESIRED_STATE_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def write_gateway_desired_state(data: dict) -> None:
+    try:
+        GATEWAY_DESIRED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GATEWAY_DESIRED_STATE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def set_gateway_desired_state(identity_id: str, desired_state: str) -> None:
+    data = load_gateway_desired_state()
+    runtimes = data.get("runtimes") if isinstance(data.get("runtimes"), dict) else {}
+    runtimes[str(identity_id)] = desired_state
+    data["runtimes"] = runtimes
+    data["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    write_gateway_desired_state(data)
 
 
 class BasicAuthBackend(AuthenticationBackend):
@@ -183,6 +212,7 @@ class GatewayManager:
         self.last_restart_at: str | None = None
         self._read_tasks: list[asyncio.Task] = []
         self._restart_task: asyncio.Task | None = None
+        self._monitor_task: asyncio.Task | None = None
 
     def pid_path(self) -> Path | None:
         if not self.runtime_path:
@@ -404,6 +434,7 @@ class GatewayManager:
     async def start(self):
         if self.process and self.process.returncode is None:
             self.desired_state = "running"
+            set_gateway_desired_state(self.identity_id, "running")
             return
         await self.stop_recorded_process()
         remaining_pids = self.tracked_gateway_pids()
@@ -434,52 +465,63 @@ class GatewayManager:
             self.write_recorded_pid()
             self.state = "running"
             self.desired_state = "running"
+            set_gateway_desired_state(self.identity_id, "running")
             self.start_time = time.time()
-            task = asyncio.create_task(self._read_output())
+            task = asyncio.create_task(self._read_output(self.process))
             self._read_tasks.append(task)
+            self._monitor_task = asyncio.create_task(self._monitor_process(self.process))
         except Exception as e:
             self.state = "error"
             self.last_error = f"Failed to start gateway: {e}"
             self.record_log(self.last_error)
 
-    async def stop(self):
+    async def stop(self, persist_desired: bool = True):
+        previous_desired_state = self.desired_state
         self.desired_state = "stopped"
+        if persist_desired:
+            set_gateway_desired_state(self.identity_id, "stopped")
         if self._restart_task and not self._restart_task.done():
             self._restart_task.cancel()
-        if not self.process or self.process.returncode is not None:
+        try:
+            if not self.process or self.process.returncode is not None:
+                self.state = "stopping"
+                await self.stop_recorded_process()
+                remaining_pids = self.tracked_gateway_pids()
+                if remaining_pids:
+                    self.state = "error"
+                    self.last_error = f"Failed to stop gateway process: {', '.join(str(pid) for pid in remaining_pids)}"
+                    self.record_log(self.last_error)
+                else:
+                    self.state = "stopped"
+                    self.start_time = None
+                    self.process = None
+                return
             self.state = "stopping"
-            await self.stop_recorded_process()
+            process = self.process
+            pid = process.pid
+            self.send_signal_to_pid(pid, signal.SIGTERM)
+            try:
+                await asyncio.wait_for(process.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                self.send_signal_to_pid(pid, signal.SIGKILL)
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    pass
             remaining_pids = self.tracked_gateway_pids()
             if remaining_pids:
                 self.state = "error"
                 self.last_error = f"Failed to stop gateway process: {', '.join(str(pid) for pid in remaining_pids)}"
                 self.record_log(self.last_error)
-            else:
-                self.state = "stopped"
-                self.start_time = None
+                return
+            self.clear_recorded_pid(pid)
+            self.state = "stopped"
+            self.start_time = None
+            if self.process is process:
                 self.process = None
-            return
-        self.state = "stopping"
-        pid = self.process.pid
-        self.send_signal_to_pid(pid, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(self.process.wait(), timeout=10)
-        except asyncio.TimeoutError:
-            self.send_signal_to_pid(pid, signal.SIGKILL)
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                pass
-        remaining_pids = self.tracked_gateway_pids()
-        if remaining_pids:
-            self.state = "error"
-            self.last_error = f"Failed to stop gateway process: {', '.join(str(pid) for pid in remaining_pids)}"
-            self.record_log(self.last_error)
-            return
-        self.clear_recorded_pid(pid)
-        self.state = "stopped"
-        self.start_time = None
-        self.process = None
+        finally:
+            if not persist_desired:
+                self.desired_state = previous_desired_state
 
     async def restart(self):
         self.desired_state = "running"
@@ -519,10 +561,28 @@ class GatewayManager:
         finally:
             self._restart_task = None
 
-    async def _read_output(self):
+    async def _monitor_process(self, process: asyncio.subprocess.Process):
         try:
-            while self.process and self.process.stdout:
-                line = await self.process.stdout.readline()
+            exit_code = await process.wait()
+        except asyncio.CancelledError:
+            return
+        self.last_exit_code = exit_code
+        self.clear_recorded_pid(process.pid)
+        if self.process is not process:
+            return
+        self.process = None
+        if self.state == "running":
+            self.state = "stopped"
+            self.start_time = None
+            self.schedule_restart_after_exit(exit_code)
+        elif self.state in {"starting", "stopping"}:
+            self.state = "stopped"
+            self.start_time = None
+
+    async def _read_output(self, process: asyncio.subprocess.Process):
+        try:
+            while process.stdout:
+                line = await process.stdout.readline()
                 if not line:
                     break
                 decoded = line.decode("utf-8", errors="replace").rstrip()
@@ -530,14 +590,6 @@ class GatewayManager:
                 self.record_log(f"[{self.name}] {cleaned}")
         except asyncio.CancelledError:
             return
-        if self.process and self.process.returncode is not None:
-            self.last_exit_code = self.process.returncode
-            self.clear_recorded_pid(self.process.pid)
-            if self.state == "running":
-                self.state = "stopped"
-                self.start_time = None
-                self.schedule_restart_after_exit(self.process.returncode)
-            self.process = None
 
     def get_status(self) -> dict:
         pid = None
@@ -682,8 +734,8 @@ class MultiGatewayManager:
     async def start(self):
         await self.start_all()
 
-    async def stop(self):
-        await self.stop_all()
+    async def stop(self, persist_desired: bool = True):
+        await self.stop_all(persist_desired=persist_desired)
 
     async def restart(self):
         await self.restart_all()
@@ -696,7 +748,23 @@ class MultiGatewayManager:
         if not self.runtimes_from_state():
             await self.start_identity(self.main_runtime_id())
 
-    async def stop_all(self):
+    async def restore_desired_on_startup(self):
+        if not GATEWAY_RESTORE_ON_START_ENABLED:
+            return
+        desired = load_gateway_desired_state()
+        desired_runtimes = desired.get("runtimes") if isinstance(desired.get("runtimes"), dict) else {}
+        runtime_ids = [
+            str(identity_id)
+            for identity_id, state in desired_runtimes.items()
+            if state == "running" and (self.runtime_config(identity_id) or str(identity_id) == self.main_runtime_id())
+        ]
+        if not runtime_ids:
+            return
+        self.logs.append(f"Restoring desired runtime gateway state for {len(runtime_ids)} runtime(s)")
+        for identity_id in runtime_ids:
+            await self.start_identity(identity_id)
+
+    async def stop_all(self, persist_desired: bool = True):
         runtime_ids = {
             str(runtime["identityId"])
             for runtime in self.runtimes_from_state()
@@ -706,7 +774,7 @@ class MultiGatewayManager:
         if not runtime_ids:
             runtime_ids.add(self.main_runtime_id())
         for identity_id in list(runtime_ids):
-            await self.stop_identity(identity_id)
+            await self.stop_identity(identity_id, persist_desired=persist_desired)
         await self.stop_unmanaged_gateways()
 
     async def restart_all(self):
@@ -740,9 +808,9 @@ class MultiGatewayManager:
         await manager.start()
         self.logs.append(f"Started runtime: {manager.name}")
 
-    async def stop_identity(self, identity_id):
+    async def stop_identity(self, identity_id, persist_desired: bool = True):
         manager = self.ensure_gateway(identity_id)
-        await manager.stop()
+        await manager.stop(persist_desired=persist_desired)
         await self.stop_unmanaged_gateways()
         self.logs.append(f"Stopped runtime: {manager.name}")
 
@@ -2186,6 +2254,13 @@ async def api_morneven_reload(request: Request):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
 
+async def startup_restore_gateways():
+    if not GATEWAY_RESTORE_ON_START_ENABLED:
+        return
+    await sync_morneven_runtime(strict=False)
+    await gateway.restore_desired_on_startup()
+
+
 routes = [
     Mount("/assets", StaticFiles(directory=str(BASE_DIR / "img")), name="assets"),
     Route("/", homepage),
@@ -2216,6 +2291,7 @@ routes = [
 app = Starlette(
     routes=routes,
     middleware=[Middleware(AuthenticationMiddleware, backend=BasicAuthBackend())],
+    on_startup=[startup_restore_gateways],
 )
 
 
@@ -2267,11 +2343,11 @@ if __name__ == "__main__":
     server = uvicorn.Server(config)
 
     def handle_signal():
-        loop.create_task(gateway.stop_all())
+        loop.create_task(gateway.stop_all(persist_desired=False))
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, handle_signal)
 
     loop.run_until_complete(server.serve(sockets=sockets))
-    loop.run_until_complete(gateway.stop_all())
+    loop.run_until_complete(gateway.stop_all(persist_desired=False))
