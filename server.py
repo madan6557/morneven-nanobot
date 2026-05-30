@@ -2254,11 +2254,18 @@ async def api_morneven_reload(request: Request):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
 
+async def restore_gateways_after_startup():
+    try:
+        await asyncio.sleep(2)
+        await sync_morneven_runtime(strict=False)
+        await gateway.restore_desired_on_startup()
+    except Exception as exc:
+        gateway.logs.append(f"Startup gateway restore failed: {exc}")
+
+
 async def startup_restore_gateways():
-    if not GATEWAY_RESTORE_ON_START_ENABLED:
-        return
-    await sync_morneven_runtime(strict=False)
-    await gateway.restore_desired_on_startup()
+    if GATEWAY_RESTORE_ON_START_ENABLED:
+        asyncio.create_task(restore_gateways_after_startup())
 
 
 routes = [
