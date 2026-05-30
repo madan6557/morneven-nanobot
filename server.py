@@ -2263,11 +2263,6 @@ async def restore_gateways_after_startup():
         gateway.logs.append(f"Startup gateway restore failed: {exc}")
 
 
-async def startup_restore_gateways():
-    if GATEWAY_RESTORE_ON_START_ENABLED:
-        asyncio.create_task(restore_gateways_after_startup())
-
-
 routes = [
     Mount("/assets", StaticFiles(directory=str(BASE_DIR / "img")), name="assets"),
     Route("/", homepage),
@@ -2299,7 +2294,6 @@ app = Starlette(
     routes=routes,
     middleware=[Middleware(AuthenticationMiddleware, backend=BasicAuthBackend())],
 )
-app.add_event_handler("startup", startup_restore_gateways)
 
 
 def create_server_socket(host, port):
@@ -2348,6 +2342,9 @@ if __name__ == "__main__":
     sockets = create_server_sockets(port)
     config = uvicorn.Config(app, log_level="info", loop="asyncio")
     server = uvicorn.Server(config)
+
+    if GATEWAY_RESTORE_ON_START_ENABLED:
+        loop.create_task(restore_gateways_after_startup())
 
     def handle_signal():
         loop.create_task(gateway.stop_all(persist_desired=False))
