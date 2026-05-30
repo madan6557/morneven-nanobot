@@ -2298,8 +2298,8 @@ routes = [
 app = Starlette(
     routes=routes,
     middleware=[Middleware(AuthenticationMiddleware, backend=BasicAuthBackend())],
-    on_startup=[startup_restore_gateways],
 )
+app.add_event_handler("startup", startup_restore_gateways)
 
 
 def create_server_socket(host, port):
