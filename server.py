@@ -1269,7 +1269,7 @@ def read_workspace_text(path):
     return content, stat
 
 
-def list_workspace_changes():
+def list_workspace_changes(include_all=False):
     manifest = load_runtime_manifest()
     manifest_files = manifest.get("files", {}) if isinstance(manifest.get("files"), dict) else {}
     changes = []
@@ -1280,7 +1280,7 @@ def list_workspace_changes():
             content_hash = workspace_content_hash(content)
             base = manifest_files.get(relative_path, {}) if isinstance(manifest_files.get(relative_path), dict) else {}
             base_hash = base.get("contentHash") if isinstance(base.get("contentHash"), str) else None
-            if base_hash == content_hash:
+            if not include_all and base_hash == content_hash:
                 continue
             changes.append({
                 "path": relative_path,
@@ -1303,7 +1303,7 @@ def list_workspace_changes():
     }
 
 
-def list_workspace_changes_at(workspace_root, manifest_path):
+def list_workspace_changes_at(workspace_root, manifest_path, include_all=False):
     workspace_root = Path(workspace_root)
     manifest = load_manifest_at(Path(manifest_path))
     manifest_files = manifest.get("files", {}) if isinstance(manifest.get("files"), dict) else {}
@@ -1320,7 +1320,7 @@ def list_workspace_changes_at(workspace_root, manifest_path):
             content_hash = workspace_content_hash(content)
             base = manifest_files.get(relative_path, {}) if isinstance(manifest_files.get(relative_path), dict) else {}
             base_hash = base.get("contentHash") if isinstance(base.get("contentHash"), str) else None
-            if base_hash == content_hash:
+            if not include_all and base_hash == content_hash:
                 continue
             changes.append({
                 "path": relative_path,
@@ -2075,6 +2075,7 @@ async def api_morneven_workspace_changes(request: Request):
         return auth_err
 
     try:
+        include_all = str(request.query_params.get("includeAll") or "").strip().lower() in {"1", "true", "yes", "all"}
         state = load_morneven_runtime_state()
         runtimes = state.get("runtimes") if isinstance(state, dict) else None
         if isinstance(runtimes, list) and runtimes:
@@ -2083,7 +2084,11 @@ async def api_morneven_workspace_changes(request: Request):
                 if not isinstance(runtime, dict):
                     continue
                 runtime_dir = Path(runtime.get("workspacePath", "")).parent
-                changes = list_workspace_changes_at(runtime.get("workspacePath", ""), runtime_dir / ".morneven-runtime-manifest.json")
+                changes = list_workspace_changes_at(
+                    runtime.get("workspacePath", ""),
+                    runtime_dir / ".morneven-runtime-manifest.json",
+                    include_all=include_all,
+                )
                 runtime_changes.append({
                     "identityId": runtime.get("identityId"),
                     "identity": {
@@ -2094,7 +2099,7 @@ async def api_morneven_workspace_changes(request: Request):
                     **changes,
                 })
             return JSONResponse({"ok": True, "runtimes": runtime_changes})
-        return JSONResponse({"ok": True, **list_workspace_changes()})
+        return JSONResponse({"ok": True, **list_workspace_changes(include_all=include_all)})
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
